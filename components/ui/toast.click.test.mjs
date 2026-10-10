@@ -27,7 +27,7 @@ function pointer(target, type, x, y, { detail = 1 } = {}) {
 function show(description, options = {}) {
   const opened = [];
   render(React.createElement(ToastProvider, null));
-  act(() => { toast.info("Agent finished", description, { onClick: () => opened.push(1), ...options }); });
+  act(() => { toast.info("Agent finished", description, { onClick: () => opened.push(1), history: true, ...options }); });
   return { opened, card: () => document.querySelector(".toast-card") };
 }
 
@@ -103,6 +103,8 @@ test("a session notification toast opens its session from a card click; one with
   assert.equal(withSession.querySelectorAll("button:not(.toast-close-button), a").length, 0);
   act(() => withSession.querySelector(".display-serif").click());
   assert.deepEqual(sessions, ["s1"]);
+  // Session notifications are a pushable type, so they are listed; opening one read it.
+  assert.deepEqual(toastHistory.get().filter((e) => e.title === "Fix bug").map((e) => [e.id, e.read]), [["s1:completed", true]]);
   const withoutSession = deliver("", "No session");
   assert.equal(withoutSession.style.cursor, "");
   act(() => withoutSession.querySelector(".display-serif").click());

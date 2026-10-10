@@ -39,9 +39,12 @@ test("clamp style helper drops the clamp when expanded", () => {
   assert.equal(expanded.cursor, "default");
 });
 
-test("history keeps the newest toasts first, capped at the limit", () => {
+test("history keeps the newest notification toasts first, capped at the limit; other toasts stay out", () => {
   toastHistory.clear();
-  for (let i = 0; i < TOAST_HISTORY_LIMIT + 5; i++) toast.info(`n${i}`);
+  toast.success("Saved");
+  toast.error("Copy failed");
+  assert.equal(toastHistory.get().length, 0);
+  for (let i = 0; i < TOAST_HISTORY_LIMIT + 5; i++) toast.info(`n${i}`, undefined, { history: true });
   const entries = toastHistory.get();
   assert.equal(entries.length, TOAST_HISTORY_LIMIT);
   assert.equal(entries[0].title, `n${TOAST_HISTORY_LIMIT + 4}`);
@@ -50,9 +53,9 @@ test("history keeps the newest toasts first, capped at the limit", () => {
 
 test("a reused toast id replaces its history entry; remove and clear drop entries", () => {
   toastHistory.clear();
-  toast.info("update v1", undefined, { id: "update" });
-  const other = toast.error("failed");
-  toast.info("update v2", undefined, { id: "update" });
+  toast.info("update v1", undefined, { id: "update", history: true });
+  const other = toast.error("failed", undefined, { history: true });
+  toast.info("update v2", undefined, { id: "update", history: true });
   assert.deepEqual(toastHistory.get().map((e) => [e.id, e.title, e.kind]), [["update", "update v2", "info"], [other, "failed", "error"]]);
 
   toastHistory.remove("update");
@@ -87,25 +90,21 @@ test("recorded OS notifications get distinct entries and notify subscribers", ()
   assert.equal(notified, 3);
 });
 
-test("new entries are unread until marked; a re-announced id stays read only with keepRead", () => {
+test("new entries are unread until marked; a re-announced id is unread again", () => {
   toastHistory.clear();
-  toast.info("Update available", undefined, { id: "update", keepRead: true });
-  toast.info("Session s1 finished", undefined, { id: "s1:completed" });
+  toast.info("Update available", undefined, { id: "update", history: true });
   toastHistory.record("info", "Task finished");
-  assert.deepEqual(toastHistory.get().map((e) => e.read), [false, false, false]);
+  assert.deepEqual(toastHistory.get().map((e) => e.read), [false, false]);
 
   toastHistory.markAllRead();
-  assert.deepEqual(toastHistory.get().map((e) => e.read), [true, true, true]);
+  assert.deepEqual(toastHistory.get().map((e) => e.read), [true, true]);
 
-  // The update toast re-fires on every tab focus; it must not re-badge.
-  toast.info("Update available", undefined, { id: "update", keepRead: true });
-  // A session's next completion reuses its tag but is news.
-  toast.info("Session s1 finished", undefined, { id: "s1:completed" });
+  // A session's next notification of the same type reuses its id; it is new.
+  toast.info("Update available", undefined, { id: "update", history: true });
   toastHistory.record("info", "Another task finished");
   assert.deepEqual(toastHistory.get().map((e) => [e.title, e.read]), [
     ["Another task finished", false],
-    ["Session s1 finished", false],
-    ["Update available", true],
+    ["Update available", false],
     ["Task finished", true],
   ]);
 
