@@ -10,6 +10,7 @@ import { ClickableImage } from "./ImageLightbox";
 import { translate, useI18n, type Locale } from "@/lib/i18n";
 import { parseCompactionSummary } from "@/lib/compaction-summary";
 import { isEmptyThinkingBlock } from "@/lib/message-display";
+import { isPassiveToolContext } from "@/lib/chat-transcript-plan";
 import { Tooltip, Collapsible, CollapsibleTrigger } from "./ui/primitives";
 import { useCopyFeedback } from "@/hooks/useCopyFeedback";
 import { formatCompactNumber } from "@/lib/format";
@@ -27,7 +28,6 @@ import {
   getHubJobs,
   getHubJobsHeader,
   getHubSendSummary,
-  summarizeToolCallGroup,
   getSemanticToolLabel,
   type ToolCategory,
 } from "./MessageView-tool-format";
@@ -79,42 +79,6 @@ function ToolCategoryIcon({
     default:
       return <Wrench size={size} strokeWidth={1.8} className={className} style={{ color: "var(--text-muted)", ...style }} />;
   }
-}
-
-type GroupedBlockItem =
-  | { type: "single"; item: { block: AssistantContentBlock; originalIndex: number } }
-  | { type: "toolGroup"; items: Array<{ block: ToolCallContent; originalIndex: number }> };
-
-function groupAdjacentBlocks(items: Array<{ block: AssistantContentBlock; originalIndex: number }>): GroupedBlockItem[] {
-  const result: GroupedBlockItem[] = [];
-  let currentGroup: Array<{ block: ToolCallContent; originalIndex: number }> | null = null;
-
-  for (const item of items) {
-    if (item.block.type === "toolCall") {
-      if (!currentGroup) currentGroup = [];
-      currentGroup.push({ block: item.block as ToolCallContent, originalIndex: item.originalIndex });
-    } else {
-      if (currentGroup) {
-        if (currentGroup.length === 1) {
-          result.push({ type: "single", item: currentGroup[0] });
-        } else {
-          result.push({ type: "toolGroup", items: currentGroup });
-        }
-        currentGroup = null;
-      }
-      result.push({ type: "single", item });
-    }
-  }
-
-  if (currentGroup) {
-    if (currentGroup.length === 1) {
-      result.push({ type: "single", item: currentGroup[0] });
-    } else {
-      result.push({ type: "toolGroup", items: currentGroup });
-    }
-  }
-
-  return result;
 }
 
 const MAX_THINKING_CACHE_ENTRIES = 100;
@@ -209,6 +173,8 @@ interface Props {
   prevTimestamp?: number;
   sessionId?: string;
   toolCallsDefaultCollapsed?: boolean;
+  /** Open thinking blocks on mount ("Expand thinking blocks by default" in Settings). */
+  expandThinkingByDefault?: boolean;
   /** omp `hideThinkingBlock`: omit thinking blocks. */
   hideThinking?: boolean;
   /** Source `content` index of each block when `message` carries a subset of an entry's blocks, so deferred thinking loads the right block. */
@@ -244,12 +210,12 @@ function haveSameRelevantToolResults(
   return true;
 }
 
-export const MessageView = memo(function MessageView({ message, isStreaming, toolResults, modelNames, cwd, onOpenFile, entryId, forkEntryId, forkEditsPrompt, onFork, forking, forkDisabled, onNavigate, prevAssistantEntryId, onEditContent, showTimestamp, prevTimestamp, sessionId, toolCallsDefaultCollapsed = true, hideThinking = false, sourceBlockIndices, liveTokensPerSecond }: Props) {
+export const MessageView = memo(function MessageView({ message, isStreaming, toolResults, modelNames, cwd, onOpenFile, entryId, forkEntryId, forkEditsPrompt, onFork, forking, forkDisabled, onNavigate, prevAssistantEntryId, onEditContent, showTimestamp, prevTimestamp, sessionId, toolCallsDefaultCollapsed = true, expandThinkingByDefault = false, hideThinking = false, sourceBlockIndices, liveTokensPerSecond }: Props) {
   if (message.role === "user") {
     return <UserMessageView message={message as UserMessage} cwd={cwd} onOpenFile={onOpenFile} entryId={entryId} onFork={onFork} forking={forking} forkDisabled={forkDisabled} onNavigate={onNavigate} prevAssistantEntryId={prevAssistantEntryId} onEditContent={onEditContent} />;
   }
   if (message.role === "assistant") {
-    return <AssistantMessageView message={message as AssistantMessage} isStreaming={isStreaming} toolResults={toolResults} modelNames={modelNames} cwd={cwd} onOpenFile={onOpenFile} showTimestamp={showTimestamp} prevTimestamp={prevTimestamp} sessionId={sessionId} entryId={entryId} forkEntryId={forkEntryId} forkEditsPrompt={forkEditsPrompt} onFork={onFork} forking={forking} forkDisabled={forkDisabled} toolCallsDefaultCollapsed={toolCallsDefaultCollapsed} hideThinking={hideThinking} sourceBlockIndices={sourceBlockIndices} liveTokensPerSecond={liveTokensPerSecond} />;
+    return <AssistantMessageView message={message as AssistantMessage} isStreaming={isStreaming} toolResults={toolResults} modelNames={modelNames} cwd={cwd} onOpenFile={onOpenFile} showTimestamp={showTimestamp} prevTimestamp={prevTimestamp} sessionId={sessionId} entryId={entryId} forkEntryId={forkEntryId} forkEditsPrompt={forkEditsPrompt} onFork={onFork} forking={forking} forkDisabled={forkDisabled} toolCallsDefaultCollapsed={toolCallsDefaultCollapsed} expandThinkingByDefault={expandThinkingByDefault} hideThinking={hideThinking} sourceBlockIndices={sourceBlockIndices} liveTokensPerSecond={liveTokensPerSecond} />;
   }
   if (message.role === "toolResult") {
     // Rendered inline under its toolCall — skip standalone rendering if paired
@@ -257,7 +223,7 @@ export const MessageView = memo(function MessageView({ message, isStreaming, too
   }
   if (message.role === "custom") {
     const custom = message as CustomMessage;
-    if (custom.customType === "xdev-mount-notice") {
+    if (custom.customType === "xdev-mount-notice" || isPassiveToolContext(custom)) {
       return null;
     }
     if (custom.customType === "compaction") {
@@ -292,6 +258,7 @@ export const MessageView = memo(function MessageView({ message, isStreaming, too
     && prev.prevTimestamp === next.prevTimestamp
     && prev.sessionId === next.sessionId
     && prev.toolCallsDefaultCollapsed === next.toolCallsDefaultCollapsed
+    && prev.expandThinkingByDefault === next.expandThinkingByDefault
     && prev.hideThinking === next.hideThinking
     && prev.sourceBlockIndices?.join() === next.sourceBlockIndices?.join()
     && (!prev.isStreaming || prev.liveTokensPerSecond === next.liveTokensPerSecond);
@@ -545,6 +512,7 @@ function AssistantMessageView({
   forking,
   forkDisabled,
   toolCallsDefaultCollapsed,
+  expandThinkingByDefault,
   hideThinking,
   sourceBlockIndices,
   liveTokensPerSecond,
@@ -566,6 +534,7 @@ function AssistantMessageView({
   forking?: boolean;
   forkDisabled?: boolean;
   toolCallsDefaultCollapsed: boolean;
+  expandThinkingByDefault: boolean;
   hideThinking: boolean;
   sourceBlockIndices?: number[];
   liveTokensPerSecond?: number | null;
@@ -729,38 +698,23 @@ function AssistantMessageView({
       </div>
 
       <div ref={bodyRef} data-selection-scope="message" tabIndex={-1} style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-        {groupAdjacentBlocks(blockItems).map((group, groupIdx) => {
-          if (group.type === "single") {
-            const { block, originalIndex } = group.item;
-            return (
-              <BlockView
-                key={`${entryId ?? "stream"}-${originalIndex}`}
-                block={block}
-                toolResults={toolResults}
-                isStreaming={isStreaming}
-                streamingDuration={streamingDurations.get(originalIndex) ?? (block.type === "thinking" ? thinkingDurationFromFile : undefined)}
-                toolCallDurations={toolCallDurations}
-                cwd={cwd}
-                onOpenFile={onOpenFile}
-                sessionId={sessionId}
-                entryId={entryId}
-                blockIndex={originalIndex}
-                toolCallsDefaultCollapsed={toolCallsDefaultCollapsed}
-              />
-            );
-          }
-          return (
-            <ToolCallGroupBlock
-              key={`${entryId ?? "stream"}-group-${groupIdx}`}
-              items={group.items}
-              toolResults={toolResults}
-              isStreaming={isStreaming}
-              toolCallDurations={toolCallDurations}
-              onOpenFile={onOpenFile}
-              toolCallsDefaultCollapsed={toolCallsDefaultCollapsed}
-            />
-          );
-        })}
+        {blockItems.map(({ block, originalIndex }) => (
+          <BlockView
+            key={`${entryId ?? "stream"}-${originalIndex}`}
+            block={block}
+            toolResults={toolResults}
+            isStreaming={isStreaming}
+            streamingDuration={streamingDurations.get(originalIndex) ?? (block.type === "thinking" ? thinkingDurationFromFile : undefined)}
+            toolCallDurations={toolCallDurations}
+            cwd={cwd}
+            onOpenFile={onOpenFile}
+            sessionId={sessionId}
+            entryId={entryId}
+            blockIndex={originalIndex}
+            toolCallsDefaultCollapsed={toolCallsDefaultCollapsed}
+            expandThinkingByDefault={expandThinkingByDefault}
+          />
+        ))}
         {errorMessage && (
           isInterrupted ? (
             <div
@@ -833,12 +787,12 @@ function AssistantMessageView({
   );
 }
 
-function BlockView({ block, toolResults, isStreaming, streamingDuration, toolCallDurations, cwd, onOpenFile, sessionId, entryId, blockIndex, toolCallsDefaultCollapsed }: { block: AssistantContentBlock; toolResults?: Map<string, ToolResultMessage>; isStreaming?: boolean; streamingDuration?: number; toolCallDurations?: Map<string, number>; cwd?: string; onOpenFile?: (filePath: string) => void; sessionId?: string; entryId?: string; blockIndex: number; toolCallsDefaultCollapsed: boolean }) {
+function BlockView({ block, toolResults, isStreaming, streamingDuration, toolCallDurations, cwd, onOpenFile, sessionId, entryId, blockIndex, toolCallsDefaultCollapsed, expandThinkingByDefault }: { block: AssistantContentBlock; toolResults?: Map<string, ToolResultMessage>; isStreaming?: boolean; streamingDuration?: number; toolCallDurations?: Map<string, number>; cwd?: string; onOpenFile?: (filePath: string) => void; sessionId?: string; entryId?: string; blockIndex: number; toolCallsDefaultCollapsed: boolean; expandThinkingByDefault: boolean }) {
   if (block.type === "text") {
     return <TextBlock block={block as TextContent} isStreaming={isStreaming} cwd={cwd} onOpenFile={onOpenFile} />;
   }
   if (block.type === "thinking") {
-    return <ThinkingBlock block={block as ThinkingContent} duration={streamingDuration} sessionId={sessionId} entryId={entryId} blockIndex={blockIndex} />;
+    return <ThinkingBlock block={block as ThinkingContent} duration={streamingDuration} sessionId={sessionId} entryId={entryId} blockIndex={blockIndex} expandByDefault={expandThinkingByDefault} />;
   }
   if (block.type === "toolCall") {
     const tc = block as ToolCallContent;
@@ -863,34 +817,57 @@ const TextBlock = memo(function TextBlock({ block, isStreaming, cwd, onOpenFile 
   && prev.onOpenFile === next.onOpenFile
 ));
 
-const ThinkingBlock = memo(function ThinkingBlock({ block, duration, sessionId, entryId, blockIndex }: {
+const ThinkingBlock = memo(function ThinkingBlock({ block, duration, sessionId, entryId, blockIndex, expandByDefault }: {
   block: ThinkingContent;
   duration?: number;
   sessionId?: string;
   entryId?: string;
   blockIndex: number;
+  expandByDefault: boolean;
 }) {
   const { t } = useI18n();
-  const [expanded, setExpanded] = useState(false);
+  // The preference only seeds the state: expanding/collapsing by hand keeps
+  // working per block. It deliberately applies to a streaming block too — the
+  // reasoning the user follows closely is exactly the one being written, a
+  // "completed only" rule would have to flip the state mid-stream (fighting a
+  // manual collapse), and remounts (reload, session switch) start from the
+  // preference again either way, so streaming and completed blocks stay
+  // consistent.
+  const [expanded, setExpanded] = useState(expandByDefault);
   const [content, setContent] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const loadingRef = useRef(false);
 
-  const handleOpenChange = (nextOpen: boolean) => {
-    setExpanded(nextOpen);
-    if (!nextOpen || !block.deferred || content !== null) return;
+  const loadDeferredContent = useCallback(() => {
+    if (!block.deferred || content !== null || loadingRef.current) return;
     if (!sessionId || !entryId) {
       setError(t("messageView.thinkingUnavailable"));
       return;
     }
 
+    loadingRef.current = true;
     setLoading(true);
     setError(null);
     void loadThinkingContent(sessionId, entryId, blockIndex)
       .then((text) => setContent(text))
       .catch((err) => setError(err instanceof Error ? err.message : String(err)))
-      .finally(() => setLoading(false));
+      .finally(() => {
+        loadingRef.current = false;
+        setLoading(false);
+      });
+  }, [block.deferred, blockIndex, content, entryId, sessionId, t]);
+
+  const handleOpenChange = (nextOpen: boolean) => {
+    setExpanded(nextOpen);
+    if (nextOpen) loadDeferredContent();
   };
+
+  // A deferred block auto-expanded by the preference must fetch its text
+  // without a click; expanding by hand runs the same loader.
+  useEffect(() => {
+    if (expanded) loadDeferredContent();
+  }, [expanded, loadDeferredContent]);
 
   return (
     <div className="activity-row" data-activity-operation="true">
@@ -934,6 +911,7 @@ const ThinkingBlock = memo(function ThinkingBlock({ block, duration, sessionId, 
   && prev.sessionId === next.sessionId
   && prev.entryId === next.entryId
   && prev.blockIndex === next.blockIndex
+  && prev.expandByDefault === next.expandByDefault
 ));
 
 
@@ -965,7 +943,6 @@ const ToolCallBlock = memo(function ToolCallBlock({
   duration,
   isStreaming,
   defaultCollapsed = true,
-  inGroup = false,
   onOpenFile,
 }: {
   block: ToolCallContent;
@@ -974,7 +951,6 @@ const ToolCallBlock = memo(function ToolCallBlock({
   isStreaming?: boolean;
   defaultCollapsed?: boolean;
   cwd?: string;
-  inGroup?: boolean;
   onOpenFile?: (filePath: string) => void;
 }) {
   const { t } = useI18n();
@@ -1003,6 +979,7 @@ const ToolCallBlock = memo(function ToolCallBlock({
             .map((b) => b.text)
             .join("\n"))
     : null;
+  const passiveContextText = result?.passiveContext ? contextLine(result.passiveContext, t) : null;
   const resultImages = result && Array.isArray(result.content)
     ? result.content.filter((b): b is ImageContent => b.type === "image")
     : [];
@@ -1047,9 +1024,9 @@ const ToolCallBlock = memo(function ToolCallBlock({
   const cleanFilePath = rawFilePath && !hasUrlScheme ? rawFilePath.split(":")[0] : null;
 
   return (
-    <div className={inGroup ? "activity-group-item" : "activity-row"} data-activity-operation="true">
+    <div className="activity-row" data-activity-operation="true">
       <Collapsible open={expanded} onOpenChange={setExpanded}>
-        <CollapsibleTrigger className={inGroup ? "activity-group-item-trigger" : "activity-row-trigger"}>
+        <CollapsibleTrigger className="activity-row-trigger">
           <span className={`activity-row-indicator${isError ? " activity-row-indicator-error" : ""}`} aria-hidden>
             {isError ? (
               <CircleAlert size={12} strokeWidth={1.8} />
@@ -1142,6 +1119,11 @@ const ToolCallBlock = memo(function ToolCallBlock({
           />
         </CollapsibleTrigger>
         {resultMeta && <div className="activity-row-secondary">{resultMeta}</div>}
+        {passiveContextText && !expanded && (
+          <div className="activity-row-secondary" title={passiveContextText}>
+            <span aria-hidden>↳ </span>{passiveContextText}
+          </div>
+        )}
         {expanded && (
           <div className={`tool-call-details${isError ? " tool-call-details-error" : ""}`}>
             <div className="tool-call-command">
@@ -1197,7 +1179,8 @@ const ToolCallBlock = memo(function ToolCallBlock({
                       {resultImages.map((img, i) => (
                         <ClickableImage
                           key={i}
-                          src={imageBlockSrc(img)}
+                          src={img.url ? `${img.url}?thumb=1` : imageBlockSrc(img)}
+                          fullSrc={img.url}
                           alt=""
                           style={{ maxWidth: 240, maxHeight: 240, borderRadius: 6, objectFit: "contain", display: "block", border: "1px solid color-mix(in srgb, var(--accent) 18%, transparent)" }}
                         />
@@ -1210,6 +1193,11 @@ const ToolCallBlock = memo(function ToolCallBlock({
                 </>
               )
             ) : null}
+            {passiveContextText && (
+              <div className="tool-call-context">
+                <span aria-hidden>↳ </span>{passiveContextText}
+              </div>
+            )}
           </div>
         )}
       </Collapsible>
@@ -1222,122 +1210,8 @@ const ToolCallBlock = memo(function ToolCallBlock({
   && prev.result === next.result
   && prev.duration === next.duration
   && prev.defaultCollapsed === next.defaultCollapsed
-  && prev.inGroup === next.inGroup
   && prev.onOpenFile === next.onOpenFile
 ));
-
-const ToolCallGroupBlock = memo(function ToolCallGroupBlock({
-  items,
-  toolResults,
-  isStreaming,
-  toolCallDurations,
-  onOpenFile,
-  toolCallsDefaultCollapsed,
-}: {
-  items: Array<{ block: ToolCallContent; originalIndex: number }>;
-  toolResults?: Map<string, ToolResultMessage>;
-  isStreaming?: boolean;
-  toolCallDurations?: Map<string, number>;
-  onOpenFile?: (filePath: string) => void;
-  toolCallsDefaultCollapsed: boolean;
-}) {
-  const { t } = useI18n();
-  const [expanded, setExpanded] = useState(!toolCallsDefaultCollapsed);
-  const blocks = items.map((i) => i.block);
-  const groupSummary = useMemo(() => summarizeToolCallGroup(blocks), [blocks]);
-
-  const hasError = blocks.some((b) => toolResults?.get(b.toolCallId)?.isError);
-  // A partial snapshot is a tool still executing, not a settled result.
-  const isPending = isStreaming && blocks.some((b) => {
-    const result = toolResults?.get(b.toolCallId);
-    return !result || result.partial === true;
-  });
-
-  const totalDuration = useMemo(() => {
-    if (!toolCallDurations) return undefined;
-    let sum = 0;
-    let counted = 0;
-    for (const b of blocks) {
-      const d = toolCallDurations.get(b.toolCallId);
-      if (d !== undefined) {
-        sum += d;
-        counted++;
-      }
-    }
-    return counted > 0 ? sum : undefined;
-  }, [blocks, toolCallDurations]);
-
-  return (
-    <div className="activity-group" data-activity-operation="true">
-      <Collapsible open={expanded} onOpenChange={setExpanded}>
-        <CollapsibleTrigger className="activity-group-header">
-          <span className="activity-group-icon-cluster" aria-hidden>
-            {groupSummary.categories.slice(0, 3).map((cat) => (
-              <ToolCategoryIcon key={cat} category={cat} size={12} />
-            ))}
-          </span>
-          <span className="activity-group-summary">
-            {groupSummary.summaryText}
-          </span>
-          {totalDuration !== undefined && (
-            <span className="activity-row-duration">
-              {t("messageView.durationSeconds", { seconds: totalDuration })}
-            </span>
-          )}
-          <span className={`activity-row-indicator${hasError ? " activity-row-indicator-error" : ""}`} aria-hidden>
-            {hasError ? (
-              <CircleAlert size={12} strokeWidth={1.8} />
-            ) : isPending ? (
-              <LoaderCircle size={12} strokeWidth={1.8} className="activity-row-spinner" />
-            ) : (
-              <Check size={12} strokeWidth={2} />
-            )}
-          </span>
-          <ChevronDown
-            size={12}
-            strokeWidth={1.8}
-            aria-hidden
-            style={{
-              flexShrink: 0,
-              transform: expanded ? "none" : "rotate(-90deg)",
-              transition: "transform var(--dur-fast) var(--ease-out-warm)",
-            }}
-          />
-        </CollapsibleTrigger>
-        {expanded && (
-          <div className="activity-group-body">
-            {items.map(({ block }) => {
-              const result = toolResults?.get(block.toolCallId);
-              const duration = toolCallDurations?.get(block.toolCallId);
-              return (
-                <ToolCallBlock
-                  key={block.toolCallId}
-                  block={block}
-                  result={result}
-                  duration={duration}
-                  isStreaming={isStreaming}
-                  defaultCollapsed={true}
-                  inGroup={true}
-                  onOpenFile={onOpenFile}
-                />
-              );
-            })}
-          </div>
-        )}
-      </Collapsible>
-    </div>
-  );
-}, (prev, next) => (
-  prev.items.length === next.items.length
-  && prev.items.every((item, i) => (
-    item.block.toolCallId === next.items[i]?.block.toolCallId
-    && item.block.toolName === next.items[i]?.block.toolName
-    && inputsShallowEqual(item.block.input, next.items[i]?.block.input)
-  ))
-  && prev.onOpenFile === next.onOpenFile
-  && (!prev.toolResults || !next.toolResults || prev.items.every((item) => prev.toolResults?.get(item.block.toolCallId) === next.toolResults?.get(item.block.toolCallId)))
-));
-
 
 function CompactionMessageView({ message }: { message: CustomMessage }) {
   const { t, locale } = useI18n();
@@ -1419,9 +1293,38 @@ function CompactionFileList({ title, files }: { title: string; files: string[] }
 function stripHiddenWrappers(text: string): string {
   let t = text.trim();
   t = t.replace(/^<!--[\s\S]*?-->\s*/, "").trim();
-  const outer = t.match(/^<([a-zA-Z0-9_-]+)(?:\s(?:[^>"]|"[^"]*")*)?>\s*([\s\S]*?)\s*<\/\1>\s*$/);
+  // No `\s*` around the lazy body: that pair backtracks super-quadratically on
+  // whitespace runs. Trim the capture instead.
+  const outer = t.match(/^<([a-zA-Z0-9_-]+)(?:\s(?:[^>"]|"[^"]*")*)?>([\s\S]*)<\/\1>$/);
   if (outer) return outer[2].trim();
   return t;
+}
+
+/**
+ * `<system-reminder reason="…" rule="…">body</system-reminder>` → tag, attributes
+ * and body. The closing tag is optional: the passive-context length cap can cut it.
+ */
+function parseLeadingWrapper(text: string): { tag: string; attrs: [string, string][]; body: string } | null {
+  const trimmed = text.trim();
+  const match = trimmed.match(/^<([\w-]+)((?:\s+[\w-]+="[^"]*")*)\s*>/);
+  if (!match) return null;
+  const closing = `</${match[1]}>`;
+  const body = trimmed.slice(match[0].length);
+  return {
+    tag: match[1],
+    attrs: [...match[2].matchAll(/([\w-]+)="([^"]*)"/g)].map((attr) => [attr[1], attr[2]]),
+    body: (body.endsWith(closing) ? body.slice(0, -closing.length) : body).trim(),
+  };
+}
+
+/** "Context (rule_violation · ts-set-map · …): body" for a wrapped passive context, plain otherwise. */
+function contextLine(text: string, t: (key: string, params?: Record<string, string>) => string): string {
+  const wrapper = parseLeadingWrapper(text);
+  const label = wrapper?.attrs.map(([, value]) => value).filter(Boolean).join(" · ");
+  const body = wrapper ? wrapper.body : text;
+  return label
+    ? t("messageView.passiveContextLabeled", { label, text: body })
+    : t("messageView.passiveContext", { text: body });
 }
 
 function friendlyHiddenLabel(customType: string, t: (key: string) => string): string {
@@ -1657,11 +1560,11 @@ function CustomMessageView({ message, cwd, onOpenFile }: { message: CustomMessag
   const isPlainText = message.customType === "async-result" || message.customType === "lsp-late-diagnostic";
   const displayText = ircEnvelope ? ircEnvelope.body : isPlainText || isDeveloper ? stripHiddenWrappers(text) : text;
   // `<system-reminder reason="…" rule="…">` → "system-reminder · reason=… · rule=…".
-  const wrapper = isDeveloper ? text.trim().match(/^<([\w-]+)((?:\s+[\w-]+="[^"]*")*)\s*>/) : null;
+  const wrapper = isDeveloper ? parseLeadingWrapper(text) : null;
   const firstLine = displayText.split("\n").find((line) => line.trim())?.trim() ?? "";
   const collapsedPreview = firstLine && firstLine !== displayText.trim() ? `${firstLine} …` : firstLine;
   const title = wrapper
-    ? [wrapper[1], ...[...wrapper[2].matchAll(/([\w-]+)="([^"]*)"/g)].map((attr) => `${attr[1]}=${attr[2]}`)].join(" · ")
+    ? [wrapper.tag, ...wrapper.attrs.map(([key, value]) => `${key}=${value}`)].join(" · ")
     : isIrc
     ? (ircEnvelope?.sender ?? formatCustomType(message.customType))
     : message.customType === "advisor"

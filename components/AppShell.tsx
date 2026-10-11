@@ -10,8 +10,9 @@ import { useNavigationHistory } from "@/hooks/useNavigationHistory";
 import { isMacPlatform, navigateShortcutHint, NAVIGATION_HISTORY_MAX_ENTRIES } from "@/lib/navigation-history";
 import { useMobileSidebarGestures } from "@/hooks/useMobileSidebarGestures";
 import { SessionSidebar } from "./SessionSidebar";
+import type { WorktreeContext } from "./SessionSidebar-helpers";
 import { ToastProvider } from "./ui/toast";
-import { toast } from "./ui/toast";
+import { toast, toastHistory, useUnreadToastCount } from "./ui/toast";
 import { ConfirmDialog } from "./ui/field";
 import { ChatWindow } from "./ChatWindow";
 import { type Tab } from "./TabBar";
@@ -20,7 +21,7 @@ import type { RightPanelView } from "./RightPanel";
 import { BranchNavigator } from "./BranchNavigator";
 import { LanguageSwitcher } from "./LanguageSwitcher";
 import { CommandPaletteMount } from "./CommandPaletteMount";
-import { Check, ChevronDown, Command, Ellipsis, Folder, History, Menu, PanelLeft, PanelRight, Terminal, Wand2, Zap } from "lucide-react";
+import { Check, ChevronDown, Command, Ellipsis, Folder, GitBranch, History, Menu, PanelLeft, PanelRight, Terminal, Wand2, Zap } from "lucide-react";
 import { ThemeSwitcher } from "./ThemeSwitcher";
 import { translate, useI18n } from "@/lib/i18n";
 import { formatApiError } from "@/lib/i18n/api-error";
@@ -33,7 +34,7 @@ import { buildAtMentionText, buildFileAtMentionsText, buildFileLineMentionText }
 import { getInitialNavigation } from "@/lib/initial-navigation";
 import { comparableProjectPath } from "@/lib/comparable-path";
 import { clearDraft } from "@/lib/draft-store";
-import { showCompletionNotification } from "@/lib/browser-notifications";
+import { useNotifications } from "@/hooks/useNotifications";
 import {
   APP_UPDATE_COMPLETED_RELOAD_MS,
   APP_UPDATE_POLL_MS,
@@ -92,6 +93,8 @@ const RightPanel = dynamic(() => import("./RightPanel").then((m) => m.RightPanel
 });
 
 const TOOL_CALLS_COLLAPSED_STORAGE_KEY = "omp-web:tool-calls-collapsed";
+// Off by default, so the transcript keeps collapsing reasoning until asked.
+const EXPAND_THINKING_STORAGE_KEY = "omp-web:expand-thinking";
 const PROVIDER_USAGE_VISIBLE_STORAGE_KEY = "omp-web:provider-usage-visible";
 const NATIVE_SELECT_ALL_STORAGE_KEY = "omp-web:scope-native-select-all";
 const OPEN_URL_AUTOMATICALLY_STORAGE_KEY = "omp-web:open-url-automatically";
@@ -104,7 +107,7 @@ type AutoNameStatus =
   | { kind: "error"; message: string };
 type TimerHandle = NodeJS.Timeout;
 
-export function AppShell() {
+export function AppShell({ appName }: { appName: string }) {
   const router = useRouter();
   const searchParams = useSearchParams();
   const [initialNavigation] = useState(() => getInitialNavigation(searchParams));
@@ -134,6 +137,9 @@ export function AppShell() {
   const [mobileSidebarReady, setMobileSidebarReady] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState<number>(SIDEBAR_DEFAULT_WIDTH);
   const [toolCallsDefaultCollapsed, setToolCallsDefaultCollapsed] = useState(true);
+  // "Expand thinking blocks by default" — like the tool-call preference, a
+  // UI-only behavior, so it lives in localStorage rather than omp's config.
+  const [expandThinkingByDefault, setExpandThinkingByDefault] = useState(false);
   const [hideThinkingBlock, setHideThinkingBlock] = useState(false);
   useEffect(() => {
     // omp's own setting, so the transcript hides thinking when the TUI does.
@@ -164,6 +170,7 @@ export function AppShell() {
     setSidebarWidth(loadSidebarWidth());
     try {
       setToolCallsDefaultCollapsed(window.localStorage.getItem(TOOL_CALLS_COLLAPSED_STORAGE_KEY) !== "false");
+      setExpandThinkingByDefault(window.localStorage.getItem(EXPAND_THINKING_STORAGE_KEY) === "true");
       setProviderUsageVisible(window.localStorage.getItem(PROVIDER_USAGE_VISIBLE_STORAGE_KEY) !== "false");
       setScopeNativeSelectAll(window.localStorage.getItem(NATIVE_SELECT_ALL_STORAGE_KEY) === "true");
       setOpenUrlAutomatically(window.localStorage.getItem(OPEN_URL_AUTOMATICALLY_STORAGE_KEY) === "true");
@@ -175,6 +182,14 @@ export function AppShell() {
     setToolCallsDefaultCollapsed(collapsed);
     try {
       window.localStorage.setItem(TOOL_CALLS_COLLAPSED_STORAGE_KEY, String(collapsed));
+    } catch {
+      // The preference still applies for this page load.
+    }
+  }, []);
+  const handleExpandThinkingByDefaultChange = useCallback((expand: boolean) => {
+    setExpandThinkingByDefault(expand);
+    try {
+      window.localStorage.setItem(EXPAND_THINKING_STORAGE_KEY, String(expand));
     } catch {
       // The preference still applies for this page load.
     }
@@ -339,7 +354,7 @@ export function AppShell() {
                 type="button"
                 onClick={() => {
                   setSettingsTab("system");
-                  toast.close("omp-update-available");
+                  toast.close(`omp-update-available:${version}`);
                 }}
                 style={{ padding: "3px 7px", border: "1px solid var(--accent-strong)", borderRadius: "var(--radius-control)", background: "var(--accent-strong)", color: "var(--on-accent)", cursor: "pointer", fontSize: 11, fontWeight: 600 }}
               >
@@ -347,7 +362,9 @@ export function AppShell() {
               </button>
             </div>
           </div>,
-          { id: "omp-update-available", timeout: 0, onClose: () => rememberDismissedVersion(DISMISSED_OMP_UPDATE_KEY, version) }
+          // Version in the id: re-announcing the same version keeps its
+          // notification-center read state; a newer version is a new notice.
+          { id: `omp-update-available:${version}`, timeout: 0, onClose: () => rememberDismissedVersion(DISMISSED_OMP_UPDATE_KEY, version) }
         );
       })
       .catch(() => {});
@@ -409,7 +426,7 @@ export function AppShell() {
                 type="button"
                 onClick={() => {
                   setSettingsTab("system");
-                  toast.close("app-update-available");
+                  toast.close(`app-update-available:${version}`);
                 }}
                 style={{ padding: "3px 7px", border: "1px solid var(--accent-strong)", borderRadius: "var(--radius-control)", background: "var(--accent-strong)", color: "var(--on-accent)", cursor: "pointer", fontSize: 11, fontWeight: 600 }}
               >
@@ -417,7 +434,7 @@ export function AppShell() {
               </button>
             </div>
           </div>,
-          { id: "app-update-available", timeout: 0, onClose: () => rememberDismissedVersion(DISMISSED_APP_UPDATE_KEY, version) }
+          { id: `app-update-available:${version}`, timeout: 0, onClose: () => rememberDismissedVersion(DISMISSED_APP_UPDATE_KEY, version) }
         );
       }
     }
@@ -980,7 +997,20 @@ export function AppShell() {
     }
   }, [isCompactOverlay]);
   const [rightPanelHasOpened, setRightPanelHasOpened] = useState(false);
-  const [rightView, setRightView] = useState<"explorer" | "git" | "file">("explorer");
+  const [rightView, setRightView] = useState<RightPanelView>("explorer");
+  const unreadNotifications = useUnreadToastCount();
+  // Unread entries stay highlighted while the Notifications tab is shown and
+  // become read once the user leaves it (switches tab or closes the panel).
+  const viewingNotifications = rightPanelOpen && rightView === "notifications" && !settingsTab;
+  const wasViewingNotificationsRef = useRef(false);
+  useEffect(() => {
+    if (wasViewingNotificationsRef.current && !viewingNotifications) toastHistory.markAllRead();
+    wasViewingNotificationsRef.current = viewingNotifications;
+  }, [viewingNotifications]);
+  const opensNotifications = unreadNotifications > 0 && !viewingNotifications;
+  const panelOpenerLabel = opensNotifications
+    ? t("appShell.showNotifications", { count: unreadNotifications })
+    : rightPanelOpen ? t("appShell.hideFilePanel") : t("appShell.showFilePanel");
   // User-chosen pixel width (null = fluid 42% default), persisted.
   const [rightPanelWidth, setRightPanelWidth] = useState<number | null>(null);
   const [rightPanelResizing, setRightPanelResizing] = useState(false);
@@ -1075,6 +1105,8 @@ export function AppShell() {
 
   const initialSessionId = initialNavigation.sessionId;
   const [activeCwd, setActiveCwd] = useState<string | null>(null);
+  // Owned by the sidebar; rendered by the file panel's Worktrees tab.
+  const [worktreeCtx, setWorktreeCtx] = useState<WorktreeContext | null>(null);
   // True once the initial ?session= URL param has been resolved (or confirmed absent)
   const [initialSessionRestored, setInitialSessionRestored] = useState<boolean>(() => !initialSessionId);
   // During the initial URL restore the sidebar adopts the restored cwd and
@@ -1330,28 +1362,34 @@ export function AppShell() {
   const handleAgentEnd = useCallback(() => {
     setRefreshKey((k) => k + 1);
     setExplorerRefreshKey((k) => k + 1);
-    if (document.visibilityState !== "hidden" || !("Notification" in window)) return;
+  }, []);
 
-    const targetSession = selectedSession;
-    const notify = () => {
-      showCompletionNotification(
-        targetSession?.name ?? translate("appShell.sessionComplete"),
-        translate("appShell.taskFinished"),
-        () => {
-          window.focus();
-          if (targetSession) handleSelectSession(targetSession);
-        },
-      );
-    };
-    if (Notification.permission === "granted") notify();
-    else if (Notification.permission === "default") {
-      void Notification.requestPermission().then((permission) => { if (permission === "granted") notify(); });
-    } else {
-      // "denied": the OS blocks notifications, so surface the completion as an
-      // in-app toast instead of leaving background completions silent.
-      toast.info(targetSession?.name ?? translate("appShell.sessionComplete"), translate("appShell.taskFinished"));
-    }
-  }, [handleSelectSession, selectedSession]);
+  // Notification clicks name a session id; the session list carries its cwd
+  // and project, which selecting needs. When the list cannot be read (the
+  // sign-in expired), load the session URL: sign-in carries it through.
+  const openSessionById = useCallback((sessionId: string) => {
+    window.focus();
+    // On narrow screens the file panel covers the chat it is about to show.
+    if (isCompactOverlay) setRightPanelOpen(false);
+    // A full load (not router navigation) so an expired sign-in reaches proxy.ts and the login page.
+    const sessionUrl = new URL(`/?session=${encodeURIComponent(sessionId)}`, window.location.origin).href;
+    void fetch("/api/sessions")
+      .then((r) => {
+        if (!r.ok) {
+          window.location.assign(sessionUrl);
+          return;
+        }
+        return (r.json() as Promise<{ sessions: SessionInfo[] }>).then((d) => {
+          const session = d.sessions.find((s) => s.id === sessionId);
+          if (session) handleSelectSession(session);
+          else toast.error(translate("notifications.sessionNotFound"));
+        });
+      })
+      .catch(() => window.location.assign(sessionUrl));
+  }, [handleSelectSession, isCompactOverlay]);
+
+  // Full-page Settings hides the chat, so its session counts as not viewed.
+  useNotifications({ sessionId: settingsTab ? null : selectedSession?.id ?? null, locale, onOpenSession: openSessionById });
 
   const handleAutoName = useCallback(async () => {
     const sessionId = selectedSession?.id;
@@ -1567,9 +1605,20 @@ export function AppShell() {
   }, []);
 
   const activeFileTab = fileTabs.find((tab) => tab.id === activeFileTabId) ?? null;
-  // Explorer tab browses the active workspace: live cwd first, then the
-  // selected / new-session cwd (mirrors what the sidebar used to pass down).
-  const explorerCwd = activeCwd ?? selectedSession?.cwd ?? newSessionCwd ?? null;
+  // Explorer, Git, and the file viewers follow the open session's folder, then
+  // the sidebar's live cwd, then the new-session cwd. Relative paths (mention,
+  // copy path) resolve against the same folder so they match the Explorer.
+  // A session whose worktree was removed (its repo's worktree list no longer
+  // contains its folder) falls back to the sidebar's cwd, the repo root.
+  const sessionCwd = selectedSession?.cwd ?? null;
+  const sessionWorktreeRemoved = sessionCwd !== null && worktreeCtx !== null
+    && comparableProjectPath(selectedSession?.projectRoot ?? sessionCwd) === comparableProjectPath(worktreeCtx.projectRoot)
+    && !worktreeCtx.worktrees.some((wt) => {
+      const root = comparableProjectPath(wt.path);
+      const cwd = comparableProjectPath(sessionCwd);
+      return cwd === root || cwd.startsWith(`${root}/`);
+    });
+  const explorerCwd = (sessionWorktreeRemoved ? null : sessionCwd) ?? activeCwd ?? newSessionCwd ?? null;
   const handleOpenLinkedFile = useCallback((filePath: string) => {
     handleOpenFile(filePath, getFileName(filePath), selectedSession?.id ?? null);
   }, [handleOpenFile, selectedSession?.id]);
@@ -1578,17 +1627,17 @@ export function AppShell() {
   // panel behaves like an editor toolbar, not just a tab strip.
   const handleMentionActiveFile = useCallback(() => {
     if (!activeFileTab) return;
-    handleAtMention(getRelativeFilePath(activeFileTab.filePath, activeCwd ?? undefined), false);
-  }, [activeFileTab, activeCwd, handleAtMention]);
+    handleAtMention(getRelativeFilePath(activeFileTab.filePath, explorerCwd ?? undefined), false);
+  }, [activeFileTab, explorerCwd, handleAtMention]);
 
   const handleCopyActiveFilePath = useCallback(() => {
     if (!activeFileTab) return;
-    const relative = getRelativeFilePath(activeFileTab.filePath, activeCwd ?? undefined);
+    const relative = getRelativeFilePath(activeFileTab.filePath, explorerCwd ?? undefined);
     copyText(relative).then(
       () => toast.success(t("appShell.copied")),
       () => toast.error(t("appShell.commandCopyFailed")),
     );
-  }, [activeFileTab, activeCwd, t]);
+  }, [activeFileTab, explorerCwd, t]);
 
   const handleDownloadActiveFile = useCallback(() => {
     if (!activeFileTab) return;
@@ -1731,7 +1780,7 @@ export function AppShell() {
   }, [sidebarHistory.exitNeedsNativeBack, t]);
 
   const activeCwdName = activeCwd ? getFileName(activeCwd) || activeCwd : null;
-  const windowTitle = activeCwdName ? `${activeCwdName} - omp web` : "omp web";
+  const windowTitle = activeCwdName ? `${activeCwdName} - ${appName}` : appName;
 
   useEffect(() => {
     const syncWindowTitle = () => {
@@ -1758,6 +1807,7 @@ export function AppShell() {
       selectedCwd={selectedSession?.cwd ?? newSessionCwd ?? null}
       onCwdChange={handleCwdChange}
       onWorkspaceOptionsChange={handleWorkspaceOptionsChange}
+      onWorktreeContextChange={setWorktreeCtx}
       addProjectOpen={addProjectOpen}
       setAddProjectOpen={setAddProjectOpen}
       usageVisible={providerUsageVisible}
@@ -1947,6 +1997,8 @@ export function AppShell() {
             activeTab={settingsTab}
             toolCallsDefaultCollapsed={toolCallsDefaultCollapsed}
             onToolCallsDefaultCollapsedChange={handleToolCallsDefaultCollapsedChange}
+            expandThinkingByDefault={expandThinkingByDefault}
+            onExpandThinkingByDefaultChange={handleExpandThinkingByDefaultChange}
             onHideThinkingBlockChange={setHideThinkingBlock}
             providerUsageVisible={providerUsageVisible}
             onProviderUsageVisibleChange={handleProviderUsageVisibleChange}
@@ -2327,14 +2379,27 @@ export function AppShell() {
             <button
               type="button"
               className="shell-toolbar-btn shell-panel-opener ui-focus-ring"
-              onClick={() => setRightPanelOpen((open) => !open)}
+              onClick={() => {
+                // Unread notifications turn the panel toggle into their shortcut.
+                if (opensNotifications) {
+                  setRightView("notifications");
+                  setRightPanelOpen(true);
+                } else {
+                  setRightPanelOpen((open) => !open);
+                }
+              }}
               aria-expanded={rightPanelOpen}
               aria-controls="workspace-file-panel"
               aria-pressed={rightPanelOpen}
-              title={rightPanelOpen ? t("appShell.hideFilePanel") : t("appShell.showFilePanel")}
-              aria-label={rightPanelOpen ? t("appShell.hideFilePanel") : t("appShell.showFilePanel")}
+              title={panelOpenerLabel}
+              aria-label={panelOpenerLabel}
             >
               <PanelRight size={16} strokeWidth={1.8} aria-hidden="true" />
+              {unreadNotifications > 0 && (
+                <span aria-hidden="true" className="panel-opener-badge">
+                  {unreadNotifications > 99 ? "99+" : unreadNotifications}
+                </span>
+              )}
             </button>
           </div>
 
@@ -2389,6 +2454,27 @@ export function AppShell() {
                     </select>
                     <ChevronDown className="new-session-workspace-chevron" size={16} strokeWidth={1.8} aria-hidden="true" />
                   </div>
+                  {/* The workspace's worktrees: picking one sets where the new
+                      session starts (same switch as the file panel's Worktrees tab). */}
+                  {worktreeCtx && worktreeCtx.worktrees.length > 1
+                    && comparableProjectPath(worktreeCtx.projectRoot) === comparableProjectPath(newSessionProject) && (
+                    <div className="new-session-workspace-control">
+                      <span className="new-session-workspace-icon" aria-hidden="true">
+                        <GitBranch size={17} strokeWidth={1.8} />
+                      </span>
+                      <select
+                        aria-label={t("sessionSidebar.switchWorktree")}
+                        aria-describedby="new-session-workspace-path"
+                        value={worktreeCtx.currentPath}
+                        onChange={(event) => worktreeCtx.select(event.target.value)}
+                      >
+                        {worktreeCtx.worktrees.map((wt) => (
+                          <option key={wt.path} value={wt.path}>{wt.branch ?? getFileName(wt.path)}</option>
+                        ))}
+                      </select>
+                      <ChevronDown className="new-session-workspace-chevron" size={16} strokeWidth={1.8} aria-hidden="true" />
+                    </div>
+                  )}
                   <div id="new-session-workspace-path" className="new-session-workspace-path" title={effectiveNewSessionCwd}>
                     {effectiveNewSessionCwd}
                   </div>
@@ -2410,6 +2496,7 @@ export function AppShell() {
               onGenerationSpeedChange={handleGenerationSpeedChange}
               onOpenProviders={() => setSettingsTab("providers")}
               toolCallsDefaultCollapsed={toolCallsDefaultCollapsed}
+              expandThinkingByDefault={expandThinkingByDefault}
               hideThinkingBlock={hideThinkingBlock}
             />
           ) : initialCwdStatus === "validating" ? (
@@ -2497,7 +2584,7 @@ export function AppShell() {
         revealPath={revealPath}
         onRevealDone={handleRevealDone}
         explorerCwd={explorerCwd}
-        activeCwd={activeCwd}
+        worktrees={worktreeCtx}
         explorerRefreshKey={explorerRefreshKey}
         fileSearchOpen={fileSearchOpen}
         onToggleFileSearch={handleToggleFileSearch}

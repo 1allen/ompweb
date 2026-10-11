@@ -12,6 +12,8 @@ const jiti = createJiti(import.meta.url, {
 });
 const { MessageView, SafeMarkdownBody, TaskResultPanel, isInterruptedMessage } = await jiti.import("./MessageView.tsx");
 const { CodeBlock } = await jiti.import("./MermaidBlock.tsx");
+const { buildSessionContext } = await jiti.import("../lib/session-reader.ts");
+const { collectToolResults, planTranscriptRows } = await jiti.import("../lib/chat-transcript-plan.ts");
 afterEach(cleanup);
 
 test("sent messages without timestamps or branch metadata still offer copy", () => {
@@ -122,7 +124,7 @@ test("expanded oversized user message can be collapsed again", (t) => {
   assert.equal(document.activeElement, toggle);
 });
 
-test("expanded grouped tool inputs follow streaming arguments without toggling output", () => {
+test("expanded tool inputs follow streaming arguments without toggling output", () => {
   const code = "print('first')\nprint('complete')";
   const editInput = { path: "/tmp/example.ts", patch: "-old\n+new", options: { dryRun: false } };
   const toolResults = new Map([["edit-call", {
@@ -141,11 +143,9 @@ test("expanded grouped tool inputs follow streaming arguments without toggling o
     },
   });
   const { container, rerender } = render(React.createElement(MessageView, props("print('first')")));
-  // Open both tool rows through their disclosure triggers. The collapsible
-  // group header is not a row, so only the group-item triggers are clicked.
-  const rowTriggers = () => [...container.querySelectorAll("button.activity-group-item-trigger")];
+  // With collapse off, each tool call is its own already-open row.
+  const rowTriggers = () => [...container.querySelectorAll("button.activity-row-trigger")];
   assert.equal(rowTriggers().length, 2);
-  for (const trigger of rowTriggers()) fireEvent.click(trigger);
   const toggles = (label) => [...container.querySelectorAll("button.tool-call-input-toggle")]
     .filter((button) => (button.textContent ?? "").includes(label));
   const inputPanels = () => [...container.querySelectorAll("div.tool-call-input")];
@@ -537,6 +537,66 @@ test("developer reminders show their wrapper attributes, start collapsed, and to
   assert.doesNotMatch(view.container.textContent, /One-line wrappers/);
 });
 
+test("passive tool context from a session file renders on the batch's last tool card", () => {
+  const at = "2026-01-01T00:00:00.000Z";
+  const entry = (id, parentId, message) => ({ type: "message", id, parentId, timestamp: at, message });
+  const { messages } = buildSessionContext([
+    entry("u1", null, { role: "user", content: "look around" }),
+    entry("a1", "u1", {
+      role: "assistant", provider: "t", model: "m",
+      content: [
+        { type: "toolCall", id: "call-1", name: "read", arguments: { path: "a.ts" } },
+        { type: "toolCall", id: "call-2", name: "bash", arguments: { command: "ls" } },
+      ],
+    }),
+    entry("r1", "a1", { role: "toolResult", toolCallId: "call-1", toolName: "read", content: [{ type: "text", text: "a" }] }),
+    entry("r2", "r1", { role: "toolResult", toolCallId: "call-2", toolName: "bash", content: [{ type: "text", text: "b" }] }),
+    entry("d1", "r2", {
+      role: "developer", attribution: "agent", passiveToolContext: true, timestamp: 1,
+      content: [{ type: "text", text: "\x1b[2mTreat\tthis result\nas authoritative.\x1b[0m" }],
+    }),
+    entry("d2", "d1", { role: "developer", content: [{ type: "text", text: "Unmarked steering note." }], timestamp: 2 }),
+    entry("a2", "d2", { role: "assistant", provider: "t", model: "m", content: [{ type: "text", text: "Done." }] }),
+  ]);
+  const toolResults = collectToolResults(messages);
+  const html = (message) => renderToStaticMarkup(React.createElement(MessageView, { message, toolResults, toolCallsDefaultCollapsed: false }));
+  // Expanded tool group, collapsed cards: one truncating row on the last card, the full text on hover.
+  const shown = html(messages[1]);
+  assert.equal(shown.match(/>Context:/g)?.length, 1);
+  assert.match(shown, /class="activity-row-secondary" title="Context: Treat\tthis result\nas authoritative\."><span aria-hidden="true">↳ <\/span>Context: Treat\tthis result\nas authoritative\./);
+  assert.ok(shown.indexOf(">read<") < shown.indexOf(">bash<"));
+  assert.ok(shown.indexOf("Context:") > shown.indexOf(">bash<"), "the line sits on the last card (call-2)");
+  assert.doesNotMatch(shown, /tool-call-context/);
+  // An expanded card shows the full text as its own segment at the end of its details instead.
+  const single = { ...messages[1], content: [messages[1].content[1]] };
+  const view = render(React.createElement(MessageView, { message: single, toolResults }));
+  fireEvent.click(view.getByRole("button", { expanded: false }));
+  const segment = view.container.querySelector(".tool-call-details .tool-call-context");
+  assert.equal(segment?.textContent, "↳ Context: Treat\tthis result\nas authoritative.");
+  assert.equal(view.container.querySelector(".activity-row-secondary[title]"), null, "no truncated row while expanded");
+  // A harness wrapper (omp's rule reminders) becomes a label instead of raw tag text.
+  const wrapped = new Map(toolResults);
+  wrapped.set("call-2", { ...toolResults.get("call-2"), passiveContext: '<system-reminder reason="rule_violation" rule="ts-set-map">\nUse a Record.\n</system-reminder>' });
+  const labeled = renderToStaticMarkup(React.createElement(MessageView, { message: single, toolResults: wrapped }));
+  assert.match(labeled, /↳ <\/span>Context \(rule_violation · ts-set-map\): Use a Record\.<\/div>/);
+  assert.doesNotMatch(labeled, /system-reminder/);
+  // The length cap can cut the closing tag; the opening tag still never leaks.
+  wrapped.set("call-2", { ...toolResults.get("call-2"), passiveContext: '<system-reminder reason="" rule="ts-set-map">\nUse a Rec' });
+  const cut = renderToStaticMarkup(React.createElement(MessageView, { message: single, toolResults: wrapped }));
+  assert.match(cut, /↳ <\/span>Context \(ts-set-map\): Use a Rec<\/div>/);
+  assert.doesNotMatch(cut, /system-reminder/);
+  // The marked message is no row of its own; the unmarked one still is.
+  assert.equal(messages[4].customType, "passive-tool-context");
+  assert.equal(html(messages[4]), "");
+  assert.equal(messages[5].customType, "developer");
+  assert.equal(messages[5].display, true);
+  assert.match(html(messages[5]), /Unmarked steering note\./);
+  assert.deepEqual(
+    planTranscriptRows(messages)[0].segments.map((segment) => segment.kind === "text" ? "text" : segment.pieces.map((piece) => piece.index)),
+    [[1, 5], "text"],
+  );
+});
+
 test("a deferred thinking block rendered from a block subset loads its source block", async (t) => {
   const requested = [];
   const originalFetch = globalThis.fetch;
@@ -554,6 +614,63 @@ test("a deferred thinking block rendered from a block subset loads its source bl
   await act(async () => { fireEvent.click(view.container.querySelector(".activity-row-trigger")); });
   assert.equal(requested.length, 1);
   assert.match(requested[0], /\/entries\/e1\/thinking\?blockIndex=2$/);
+});
+
+test("thinking blocks stay collapsed by default and open with the expand preference", async () => {
+  const message = {
+    role: "assistant",
+    provider: "t",
+    model: "m",
+    content: [{ type: "thinking", thinking: "weighing the options" }, { type: "text", text: "Answer" }],
+  };
+  const html = (props) => renderToStaticMarkup(React.createElement(MessageView, { message, ...props }));
+  // Default (off): unchanged behavior — the reasoning text is not rendered.
+  assert.doesNotMatch(html({}), /weighing the options/);
+  assert.doesNotMatch(html({ expandThinkingByDefault: false }), /weighing the options/);
+  // On: the block is open on mount, so reading reasoning needs no clicks.
+  assert.match(html({ expandThinkingByDefault: true }), /weighing the options/);
+  // The same initial state covers a streaming block on purpose (see ThinkingBlock):
+  // the reasoning the preference is meant to expose is the one being written.
+  assert.match(html({ expandThinkingByDefault: true, isStreaming: true }), /weighing the options/);
+});
+
+test("an expanded thinking block collapses and re-expands by hand", async () => {
+  const message = {
+    role: "assistant",
+    provider: "t",
+    model: "m",
+    content: [{ type: "thinking", thinking: "weighing the options" }],
+  };
+  const view = render(React.createElement(MessageView, { message, expandThinkingByDefault: true }));
+  const output = () => view.container.querySelector(".thinking-output")?.textContent;
+  assert.equal(output(), "weighing the options");
+  const trigger = view.container.querySelector(".activity-row-trigger");
+  await act(async () => { fireEvent.click(trigger); });
+  assert.equal(output(), undefined);
+  await act(async () => { fireEvent.click(trigger); });
+  assert.equal(output(), "weighing the options");
+});
+
+test("a deferred thinking block auto-expanded by the preference loads its source block", async (t) => {
+  const requested = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    requested.push(String(url));
+    return new Response(JSON.stringify({ thinking: "loaded" }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+  // Ids of their own: loadThinkingContent caches per (session, entry, block),
+  // and the click test above already loaded s1/e1 block 2 in this process.
+  const view = render(React.createElement(MessageView, {
+    message: { role: "assistant", provider: "t", model: "m", content: [{ type: "thinking", thinking: "", deferred: true }] },
+    sessionId: "s2",
+    entryId: "e2",
+    sourceBlockIndices: [3],
+    expandThinkingByDefault: true,
+  }));
+  await waitFor(() => assert.equal(view.container.querySelector(".thinking-output")?.textContent, "loaded"));
+  assert.equal(requested.length, 1);
+  assert.match(requested[0], /\/entries\/e2\/thinking\?blockIndex=3$/);
 });
 
 test("a running tool call shows a spinner instead of the no-result marker", () => {
@@ -655,9 +772,8 @@ test("expanded edit results with a patch render the split diff view", () => {
   assert.doesNotMatch(html, /<pre/);
 });
 
-test("consecutive tool calls group into an activity group summary", () => {
+test("parallel tool calls each render as their own row, never a merged group", () => {
   const html = renderToStaticMarkup(React.createElement(MessageView, {
-    isStreaming: true,
     toolCallsDefaultCollapsed: true,
     message: {
       role: "assistant",
@@ -669,24 +785,8 @@ test("consecutive tool calls group into an activity group summary", () => {
     },
   }));
 
-  assert.match(html, /activity-group/);
-  assert.match(html, /Read 2 files and searched 1 time/);
-});
-
-test("bash (local) rows count as terminal commands in group summaries", () => {
-  const html = renderToStaticMarkup(React.createElement(MessageView, {
-    isStreaming: true,
-    toolCallsDefaultCollapsed: true,
-    message: {
-      role: "assistant",
-      content: [
-        { type: "toolCall", toolCallId: "call-1", toolName: "bash", input: { command: "go vet ./..." } },
-        { type: "toolCall", toolCallId: "call-2", toolName: "bash (local)", input: { command: "go test ./..." } },
-      ],
-    },
-  }));
-
-  assert.match(html, /Ran 2 commands/);
+  assert.equal(html.match(/class="activity-row-trigger"/g)?.length, 3);
+  for (const target of ["a.ts", "b.ts", "test"]) assert.match(html, new RegExp(target));
 });
 
 test("todo tool calls render clean status badge with action and task name", () => {

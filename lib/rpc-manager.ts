@@ -20,8 +20,11 @@ import { PRESET_FULL } from "./tool-presets";
 import { comparableProjectPath } from "./comparable-path";
 import { samePath } from "./paths";
 import { isRecord } from "./type-guards";
+import { BLOCKING_UI_METHODS, createNotificationDetector } from "./notification-events";
+import { publishNotification } from "./notification-hub";
 import { parseSkillDiagnosticsSnapshot, type SkillDiagnosticsSnapshot } from "./skill-diagnostics";
 import { isReservedLaunchArg, loadProjectRegistry } from "./project-registry";
+import { eventWithToolResultImageUrls } from "./media-cache";
 import type {
   BashResultInfo,
   OmpModel,
@@ -107,10 +110,6 @@ export class WebRpcError extends Error {
     this.code = code;
   }
 }
-
-// Extension UI methods that stay pending until the client answers (replayed to
-// newly-attached SSE listeners so dialogs survive reconnects).
-const PENDING_UI_METHODS = new Set(["select", "confirm", "input", "editor", "ask", "open_url"]);
 
 /** Shape check for an ask-dialog `answers` payload; omp validates the content. */
 function isAskAnswers(value: unknown): boolean {
@@ -329,6 +328,11 @@ export class AgentSessionWrapper {
    * the same conversation moving to a sibling file, not a session switch. */
   private sessionMovePending = false;
   private unsubscribeFrames: (() => void) | null = null;
+  private readonly detectNotification = createNotificationDetector();
+  /** Agent activity since the last `session_settled`: background work may still run after the turn ended. */
+  private unsettled = false;
+  /** Ids this conversation had before omp moved it to a new file. */
+  private readonly movedFromIds: string[] = [];
   private initPromise: Promise<void> | null = null;
   private restarting = false;
   private mcpListWaiter: { resolve: (text: string) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> } | null = null;
@@ -552,6 +556,8 @@ export class AgentSessionWrapper {
       this.awaitingAgentStart = false;
       this.awaitingAgentStartDeadline = 0;
       this.continuationGraceUntil = 0;
+      // A different conversation now: the old one's ids must not suppress its notifications.
+      this.movedFromIds.length = 0;
     }
     this._sessionId = state.sessionId;
     this._sessionFile = state.sessionFile ?? "";
@@ -563,6 +569,8 @@ export class AgentSessionWrapper {
     if (moved) {
       this.sessionMovePending = false;
       if (oldId !== this._sessionId) {
+        // Tabs still showing the old id are still viewing this conversation.
+        this.movedFromIds.push(oldId);
         // Keep the old id routable: other tabs still address it, and a fresh
         // `--resume` of the old file would fork again (its owner lives on).
         this.onIdentityChangeCallback?.(oldId, this._sessionId, { keepOldId: true });
@@ -658,7 +666,20 @@ export class AgentSessionWrapper {
     // Terminal agent_end so a client mid-stream stops spinning immediately
     // instead of waiting for the reconcile poll.
     if (this.streaming || this.promptRunning) this.emit({ type: "agent_end", isTerminal: true, messages: [] });
+    if (this.streaming || this.promptRunning || this.unsettled) {
+      this.publishNotifications({ type: "process_exit", detail: detail || status });
+    }
     this.destroy();
+  }
+
+  private publishNotifications(frame: Record<string, unknown>): void {
+    const session = {
+      sessionId: this._sessionId,
+      sessionName: this._sessionName || this.cwd.split(/[\\/]/).filter(Boolean).pop() || null,
+    };
+    for (const notification of this.detectNotification(frame, session)) {
+      publishNotification(this.movedFromIds.length ? { ...notification, aliases: this.movedFromIds } : notification);
+    }
   }
 
   private handleFrame(frame: RpcFrame): void {
@@ -681,6 +702,7 @@ export class AgentSessionWrapper {
         break;
       }
       case "agent_start":
+        this.unsettled = true;
         this.promptRunning = true;
         this.streaming = true;
         this.awaitingAgentStart = false;
@@ -712,6 +734,9 @@ export class AgentSessionWrapper {
         } else {
           this.continuationGraceUntil = Date.now() + NON_TERMINAL_CONTINUATION_GRACE_MS;
         }
+        break;
+      case "session_settled":
+        this.unsettled = false;
         break;
       case "prompt_result":
         // Local-only prompt (builtin/extension slash command) — no agent run.
@@ -767,7 +792,9 @@ export class AgentSessionWrapper {
           this.promptRunning = false;
           this.awaitingAgentStart = false;
           this.awaitingAgentStartDeadline = 0;
-          this.emit({ type: "prompt_error", errorMessage: detail, error: event.error, command: event.command });
+          const promptError = { type: "prompt_error", errorMessage: detail, error: event.error, command: event.command };
+          this.publishNotifications(promptError);
+          this.emit(promptError);
           notifyRunningChange();
           return;
         }
@@ -855,6 +882,7 @@ export class AgentSessionWrapper {
       }
     }
 
+    this.publishNotifications(event);
     this.emit(event);
     notifyRunningChange({ refreshSessionList });
   }
@@ -895,7 +923,9 @@ export class AgentSessionWrapper {
       this.proc.sendFrame({ type: "extension_ui_response", id, confirmed: true });
       return true;
     }
-    if (PENDING_UI_METHODS.has(method)) {
+    // Blocking dialogs stay pending until the client answers (replayed to
+    // newly-attached SSE listeners so dialogs survive reconnects).
+    if (BLOCKING_UI_METHODS.has(method)) {
       this.forgetPendingUiRequest(id);
       const timeout = typeof event.timeout === "number" ? event.timeout : undefined;
       if (timeout && timeout > 0) {
@@ -990,7 +1020,10 @@ export class AgentSessionWrapper {
     this.pendingHostUris.clear();
   }
 
-  private emit(event: UnsequencedAgentEvent): void {
+  private emit(nativeEvent: UnsequencedAgentEvent): void {
+    // Tool-result images go out (and into the replay snapshot) as media URLs:
+    // big screenshots must never sit in the browser's chat state as base64.
+    const event = eventWithToolResultImageUrls(nativeEvent);
     // `web` belongs to this wrapper, never to native/extension-supplied frames.
     // Strip it before caching tool snapshots as well as before wire emission.
     delete event.web;
@@ -1462,9 +1495,12 @@ export class AgentSessionWrapper {
 
     switch (type) {
       case "prompt": {
-        if (this.bashRunning) {
-          throw new Error("Cannot send a prompt while a shell command is running");
-        }
+        // A `!!` shell command owns the session until it exits (omp rejects a
+        // prompt then, and treating that as a hard error tore down the client's
+        // optimistic turn and lost the message). Degrade into omp's own
+        // follow-up queue instead: omp keeps owning the chips and delivers the
+        // message once the shell command releases the session.
+        if (this.bashRunning) return await this.queueWhileShellRunning(command);
         const streamingBehavior = command.streamingBehavior as "steer" | "followUp" | undefined;
         if (!streamingBehavior) {
           this.responseObserved = false;
@@ -1527,6 +1563,10 @@ export class AgentSessionWrapper {
 
       case "steer":
       case "follow_up": {
+        // `steer` has the same collision while a `!!` shell command runs — and
+        // there is no live turn to steer anyway, so it joins the follow-up
+        // queue like a prompt would.
+        if (type === "steer" && this.bashRunning) return await this.queueWhileShellRunning(command);
         await this.proc.sendCommand({
           type,
           message: command.message as string,
@@ -1793,6 +1833,27 @@ export class AgentSessionWrapper {
         throw new Error(`Unsupported command: ${type}`);
       }
     }
+  }
+
+  /**
+   * Degrade a prompt/steer frame into omp's follow-up queue while omp-web's own
+   * `!!` shell command owns the child (`bashRunning`, set for the whole `bash`
+   * RPC). omp would refuse a prompt then — and aborting or erroring loses the
+   * user's message mid-task — so the message is forwarded as `follow_up`
+   * instead: the queue stays omp-owned (its `queue_update`/`get_state`
+   * snapshots feed every client's chips) and omp delivers the message after the
+   * shell command finishes, exactly as a queued follow-up sent during a run.
+   * The reply carries the degradation so the client can tell the user their
+   * message was queued, not steered.
+   */
+  private async queueWhileShellRunning(command: Record<string, unknown>): Promise<unknown> {
+    const images = toImageContents(command.images);
+    await this.proc.sendCommand({
+      type: "follow_up",
+      message: command.message as string,
+      ...(images ? { images } : {}),
+    });
+    return { queued: true, queue: "followUp", reason: "shellRunning" };
   }
 
   destroy(): void {

@@ -64,12 +64,16 @@ app/api/
   agent/new/route.ts              POST { cwd, message, toolNames?, provider?, modelId? }
   agent/[id]/route.ts             GET state | POST any RPC command
   agent/[id]/events/route.ts      GET SSE stream
-  agent/running/events/route.ts   GET SSE stream of currently-running session ids
+  agent/running/events/route.ts   GET SSE stream of currently-running session ids (+ this tab's notifications)
+  notifications/devices/route.ts  GET VAPID key + subscribed | PUT { deviceId, prefs, subscription? }
+  notifications/presence/route.ts POST { clientId, deviceId, visible, sessionId, seq }
+  notifications/test/route.ts     POST { deviceId } send a test push (502 on push-service refusal)
   auth/**                         provider list, login/logout, API keys (via RPC)
   cwd/validate/route.ts           POST validate/select a cwd
   default-cwd/route.ts            POST create ~/omp-cwd-YYYYMMDD
   files/[...path]/route.ts        GET file contents for viewer
   github-repo/route.ts            GET ?cwd= — GitHub owner/repo of the checkout (for #N links)
+  media/[hash]/route.ts           GET tool-result image by sha256 (?thumb=1 → 480px WebP preview)
   home/route.ts                   GET user home directory
   models/route.ts                 GET { models, modelList, defaultModel }
   models-config/route.ts          GET/PUT — read/write ~/.omp/agent/models.yml
@@ -95,6 +99,7 @@ lib/
   btw.ts               /btw side-question records + pure frame/snapshot merge (order-safe)
   draft-store.ts       local draft persistence helpers
   file-access.ts       allowed file roots for /api/files and worktrees
+  media-cache.ts       tool-result images → /api/media URLs; media copies + thumbnails
   file-paths.ts        client/server path encoding helpers
   github-refs.ts       remark plugin linking #N / owner/repo#N + GithubRepoContext
   git-clone.ts         pure clone helpers: URL→directory name (https/ssh only), \r-aware progress log
@@ -102,11 +107,18 @@ lib/
   markdown.ts          shared markdown helpers
   npx.ts               npx runner used by skill install
   pi-types.ts          local structural types for agent/RPC objects
+  project-command-env.ts  child-process environments: strips PORT/NODE_ENV/NEXT_* and omp-web's secrets
   project-ordering.ts  pure project sort/group/activity helpers (client + tests)
   project-registry.ts  on-disk managed-project registry (~/.omp/agent/projects.json)
+  notification-events.ts  shared: event/prefs types, frame→event detector, renderNotification()
+  notification-hub.ts  server: presence, device store + VAPID keys, routing, Web Push
+  notification-client.ts  browser: device id, prefs store, service worker + push subscription
   rpc-manager.ts       session registry + startRpcSession over RpcProcess
   session-reader.ts    session .jsonl parsing + path cache + buildSessionContext
   session-resume.ts    running-session list for auto-resume after a restart
+  web-auth.ts          password-hash check + session cookie signing
+  web-auth-secret.ts   per-installation session-signing key (~/.omp/agent/omp-web/web-auth-secret.json)
+  web-password-hash.ts typed view of bin/omp-web-password-hash.js (the scrypt hash format)
   web-settings.ts      omp-web server settings (~/.omp/agent/omp-web-settings.json)
   skills-service.ts    skill listing via `omp skill list --json`; pure-Node replica scan as fallback
   tool-presets.ts      PRESET_NONE/DEFAULT/FULL + getToolNamesForPreset()
@@ -129,6 +141,7 @@ components/
   CommandPalette.tsx  ⌘K/Ctrl+K palette (cmdk): session switch, new session, theme
   ImageLightbox.tsx   click-to-preview lightbox for chat images (ClickableImage)
   BranchNavigator.tsx in-session branch switcher
+  NotificationList.tsx right-panel Notifications tab: in-memory history of session notifications (`toastHistory`)
   ChatMinimap.tsx     scroll minimap alongside the message list
   MarkdownBody.tsx    markdown renderer
   ModelsConfig.tsx    modal for models/auth configuration
@@ -139,11 +152,13 @@ components/
   FileViewer.tsx      file content in a tab
   GhostMirror.tsx     textarea overlay painting ghost-text word completion
   TabBar.tsx          tab bar (Chat + open file tabs)
+  WorktreesPanel.tsx  file-panel Worktrees tab: list/switch/create/remove the active repo's worktrees
   ui/                 shared primitives: Dialog/Tooltip/Collapsible, fields, toast
 
 hooks/
   useAgentSession.ts       messages + streaming + SSE + fork/navigate/reconciliation logic
   useAudio.ts              completion sound + browser AudioContext unlock
+  useNotifications.ts      presence reports, toast/system delivery, notification clicks
   useDragDrop.ts           shared drag/drop state
   useIsMobile.ts           responsive breakpoint hook
   usePrefersReducedMotion.ts OS reduce-motion preference (SMIL-safe)
@@ -245,6 +260,35 @@ wait for that commit:
 - Live entries are cleared on `agent_start`, terminal `agent_end`, prompt
   send/settlement failure — a tool must never leak into the next run.
 
+### Reasoning display ("Expand thinking blocks by default")
+- `ThinkingBlock` (`components/MessageView.tsx`) seeds `expanded` from
+  `expandThinkingByDefault`, plumbed and stored exactly like
+  `toolCallsDefaultCollapsed` (`omp-web:expand-thinking` in `AppShell`, off by
+  default). It is an initial value only: manual collapse/expand keeps working
+  per block, and a reload remounts from the preference.
+- The preference deliberately covers a **streaming** block too. A "completed
+  only" rule would have to flip the state mid-stream (fighting a manual
+  collapse), and remounts start from the preference either way, so streaming and
+  completed blocks stay consistent.
+- Auto-expanded historical blocks are `deferred` (thinking text is fetched on
+  demand), so a mount effect loads their content through the same loader the
+  click path uses — one request per mount, cached per (session, entry, block).
+
+### Tool-result images (`lib/media-cache.ts`, `/api/media/[hash]`)
+- Tool-result images never reach the browser as base64. History (`deferMedia`)
+  and live frames (`AgentSessionWrapper.emit`, which also feeds the replay
+  snapshot) replace each image with `{type:"image", mimeType, url:"/api/media/<sha256>"}`.
+  User-message and custom-message images stay inline.
+- The hash is omp's blob address (sha256 of the bytes): blob refs map directly
+  (a missing blob becomes the `[image unavailable …]` text), inline images are
+  hashed and copied to `<omp-web dir>/media/`. omp writes blobs in place, so the
+  route serves the copy until the blob has the copy's size. A daily sweep (run
+  on the next media write) deletes copies omp now holds and files older than
+  30 days.
+- `ToolCallBlock` shows `?thumb=1` (480px WebP made once with `sharp` and cached
+  next to the copies; full image if sharp is unavailable) and opens the full
+  image in the lightbox. The route serves only PNG/JPEG/GIF/WebP by magic bytes.
+
 ### Event protocol differences vs pi
 omp emits no `prompt_done` / `prompt_error` / `compaction_start` /
 `compaction_end` events. Completion is `agent_end` (`isTerminal !== false`),
@@ -280,6 +324,16 @@ confirms. A follow-up that answers `removed: false` is retried on `steering`
 (a concurrent promotion moved it); never the reverse. Every abort is fenced to
 the prompt run id captured at the click, so it cannot kill a prompt started
 during the wait.
+- Submitting during a run defaults to **Queue follow-up**
+  (`lib/composer-prefs.ts`, `omp-web:submit-during-run`); only an explicitly
+  stored choice overrides it, and an absent key yields `queue`.
+- omp-web's own `!!` shell command (`bashRunning`, set for the whole `bash`
+  RPC) is the one state omp refuses a prompt in. The wrapper degrades instead
+  of throwing (`queueWhileShellRunning` in `lib/rpc-manager.ts`): the frame is
+  forwarded as omp's `follow_up` — never aborted, never reimplemented here —
+  and the reply reports it (`{queued:true, queue:"followUp",
+  reason:"shellRunning"}`), which the hook surfaces as a notice while rolling
+  the phantom optimistic turn back. The chip still comes from omp's snapshot.
 
 ### Running state SSE + reconciliation
 - The sidebar listens to `/api/agent/running/events`, backed by `subscribeRunningSessions()` in `lib/rpc-manager.ts`, so running badges update without polling.
@@ -398,6 +452,8 @@ during the wait.
 - Worktree operations are served by `/api/worktrees` and guarded by the same allowed-root rules as `/api/files`.
 - New worktrees are created under `<repoRoot>-worktrees/<sanitized-branch>`. Existing branches are reused; otherwise `git worktree add -b` creates the branch.
 - Removing a dirty worktree returns `409` with `{ dirty: true }` so the UI can ask before retrying with `force`.
+- The file panel's **Worktrees** tab (`components/WorktreesPanel.tsx`) switches, creates, and removes worktrees; the new-session screen's worktree `<select>` (AppShell, shown when the selected workspace has 2+ worktrees) only switches. `SessionSidebar` owns the per-repo worktree cache and the actions and emits them as a `WorktreeContext` (`onWorktreeContextChange`, null unless the active workspace is a Git top-level repo); AppShell hands it to both. Switching moves the sidebar's effective cwd (where a new session starts), not the open session.
+- Explorer, Git, and file viewers use `explorerCwd` in AppShell: the open session's cwd first, then the sidebar's cwd, then the new-session cwd. Mention/copy-path helpers resolve relative paths against the same value.
 - Sessions whose cwd points at a removed worktree are inferred back into the main project instead of becoming a phantom project row.
 
 ### Managed projects sidebar (`lib/project-registry.ts`, `/api/projects`)
@@ -424,8 +480,7 @@ during the wait.
   still-loading list must never wipe storage).
 - Each project's session tree is capped at 5 roots with a show-more toggle;
   project rows are cards matching the session items' height/margins/accent
-  treatment, and the active project's worktree selector renders directly
-  below its row.
+  treatment. Rows show no worktree/branch selector (see the Worktrees tab).
 
 ### Clone a repository as a new workspace (`/api/projects/clone`)
 - The Add-workspace `DirectoryPicker` takes an optional Git URL; "Clone here"
@@ -495,7 +550,7 @@ during the wait.
 - Notifications in `AppShell` and settings cards in `SettingsConfig` present the update notification alongside copyable terminal update commands.
 
 ### Auth and model config
-- Auth flows go through RPC commands (`get_login_providers`, `login`) against the omp child process; credentials live in omp's `agent.db` (SQLite) which omp-web never touches directly.
+- Auth flows go through RPC commands (`get_login_providers`, `login`, `get_logout_accounts`, `logout`) against the omp child process; credentials live in omp's `agent.db` (SQLite) which omp-web never touches directly. `/api/auth/accounts/[provider]` lists stored accounts and removes one by `credentialId`; omp without those commands reports `supported: false` and the UI falls back to the read-only `omp usage` account list.
 - The Models panel reads and writes `models.yml` in the omp agent directory (`~/.omp/agent/models.yml`, `.yaml` fallback).
 - API-key status endpoints must never return the raw key.
 
@@ -583,6 +638,59 @@ during the wait.
 - `hooks/useAudio.ts` stores the toggle in `localStorage` and reuses one `AudioContext`.
 - Browser autoplay policy means sound must be unlocked from a user gesture; `ChatInput` calls the unlock hook from interactive controls, and `ChatWindow` plays the tone from `onAgentEnd`.
 
+### Notifications (`lib/notification-*.ts`, `public/sw.js`, Settings → Notifications)
+- Detection runs on the server in `AgentSessionWrapper.handleFrame` (and
+  `handleProcessExit` for crashes), so sessions no tab watches still notify.
+  `createNotificationDetector()` only inspects top-level frames; subagent
+  activity is wrapped in `subagent_*` frames and never notifies. "Completed"
+  fires on `session_settled` (not `prompt_result`), so background work started
+  by the prompt is done too; a failed or aborted last prompt suppresses it.
+  Auto-approved tool confirmations return before the hook and never notify.
+  omp sends `retry_fallback_applied` before the `auto_retry_start` of the same
+  failure, so the detector holds a reason-less fallback until that frame.
+  Failures also arrive as omp-web's own `prompt_error` (failed `response`) and
+  `process_exit` frames; the detector reports one failure per run.
+- A session omp moved to a new file keeps its old ids as `aliases` on the
+  event, so a tab still showing an old id counts as viewing it.
+- Presence and streams are separate on purpose. Presence: each tab reports
+  `{clientId, deviceId, visible, sessionId}` to `/api/notifications/presence`
+  (visibility/session change, input after idling, every 30 s while present;
+  expires 60 s after receipt). `visible` means visible AND input within 3 min.
+  `sessionId` is null while full-page Settings hides the chat. Streams: the
+  tab's open SSE connections (`attachNotificationClient`), which reconnect and
+  overlap independently of presence. `clientId` is per page load, `deviceId`
+  per browser (`localStorage`). Reports carry a per-page `seq`; the server
+  drops one older than the stored report (requests can arrive out of order).
+  Prefs PUTs run one at a time and read the prefs when sent, for the same reason.
+- Routing (`routeNotification`, unit-tested): a visible tab on the session
+  drops the event everywhere (presence only, so a reconnecting stream cannot
+  leak it); else if a visible tab with an open stream exists, `whenActive:
+  "toast"` devices get a toast on their active tabs only; else push (subscribed
+  devices) or in-page `showNotification` (tabs with an open stream).
+- The server decides before pushing: iOS revokes push permission for pushes
+  that display nothing, so `public/sw.js` always shows what it receives.
+- Notifications ride the sidebar's `/api/agent/running/events?clientId=` stream,
+  not a new SSE connection: browsers allow six HTTP/1.1 connections per host.
+  `SessionSidebar` re-dispatches them as a window event. The sidebar unmounts
+  while Settings is open, so that tab gets no toasts then; it also stops
+  counting as active, so other devices are not silenced.
+- Prefs and push subscriptions are per device, in `localStorage` and mirrored to
+  `~/.omp/agent/omp-web/notifications.json` (mode 0600; also holds the VAPID
+  private key). The server reads that file on every use, never caching it: an
+  installed server and `npm run dev` can share the agent dir. Push text is
+  rendered server-side in the device's locale. Browsers with saved settings (enabled or not) sync on load; never-configured browsers do not.
+- A crash notifies "Run failed" while a run is live or while background work
+  started by it has not settled yet (`unsettled`, cleared by `session_settled`).
+- The Settings test button pushes through the server for subscribed devices
+  (502 with the push service's answer on failure) and shows a local
+  notification otherwise, or a toast where none are allowed.
+- `/sw.js` and `/badge-96.png` are exempt from the password gate (`proxy.ts`):
+  browsers re-fetch the worker for updates without the session cookie.
+- Notification clicks survive an expired sign-in: `proxy.ts` sends `/?session=…`
+  to `/login?next=/?session=…`, and `LoginForm` returns there (only `/?…`
+  targets are accepted). The worker navigates non-app windows to the session
+  URL; the app falls back to that URL when `/api/sessions` cannot be read.
+
 ## Git history and PR landing rules
 
 - **Never rewrite `main`'s history** — no force-push, `filter-branch`, rebase
@@ -648,6 +756,29 @@ motion: --dur-fast (150ms) --dur-med (220ms) --dur-slow (320ms) --ease-out-warm
 `components/ui/` holds the shared primitives (built on `@base-ui/react`):
 `primitives.tsx` (Dialog/Tooltip/Collapsible), `field.tsx` (form fields +
 ConfirmDialog), `toast.tsx` (`toast.success/error/info`, mounted in AppShell).
+Only toasts passed `history: true` land in `toastHistory`, the last 100 kept
+in memory for the right panel's Notifications tab, with their `onClick`;
+`useNotifications` sets it for session notifications (the pushable types:
+completed, input, error, model switch), so plain status toasts ("Saved", update
+notices) stay out. System notifications are recorded with
+`toastHistory.record()` (also with the session `onClick`): those the page shows
+itself in `useNotifications`, and Web Pushes when `public/sw.js` posts
+`omp-notification-shown` to open tabs; a push with no tab open is not listed.
+An entry with an `onClick` runs it on click or Enter, like the toast card.
+Unread entries badge the right-panel toggle, which then opens the Notifications
+tab; entries become read when the user leaves that tab, uses Mark all as read,
+or runs the toast's `onClick` action (`toastHistory.markRead`), and a reused id
+is unread again. Unread rows show a leading accent dot and a bold title; read
+rows are dimmed. Toasts and Notifications entries dismiss on
+a sideways touch/pen swipe (base-ui's toast swipe; `NotificationRow` for the
+list) and carry `data-swipe-dismiss`, which the mobile sidebar gesture skips.
+`useDragClickGuard` swallows the click that ends any drag on them, judged by
+the whole travel. `createSwipeTracker` cancels a swipe the finger turned back
+(16px from its farthest point), as on Android; for toasts the release is
+converted into the `pointercancel` base-ui treats as "snap back".
+The `onClick` option makes the whole card the action: a click outside its
+buttons, links and expandable text, ignoring drags and text selection, or Enter
+on the focused card. There is no separate action button).
 Icons come from `lucide-react` — do not add new inline SVGs. The command
 palette (`components/CommandPalette.tsx`, ⌘K/Ctrl+K) is built on `cmdk`.
 

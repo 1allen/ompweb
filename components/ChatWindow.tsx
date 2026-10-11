@@ -3,9 +3,9 @@ import { sendAgentCommand } from "@/lib/agent-client";
 import { registerAbortHandler } from "@/hooks/useKeyboardShortcuts";
 import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type Ref } from "react";
 import { ArrowDown, ChevronDown, ChevronUp, Layers, Paperclip, Square } from "lucide-react";
-import type { AgentMessage, AssistantContentBlock, AssistantMessage, BashExecutionMessage, ExtensionUiRequest, SessionInfo, SessionTreeNode, ToolCallContent, ToolResultMessage } from "@/lib/types";
+import type { AgentMessage, AssistantContentBlock, AssistantMessage, BashExecutionMessage, ExtensionUiRequest, SessionInfo, SessionTreeNode, ToolResultMessage } from "@/lib/types";
 import { translate, useI18n } from "@/lib/i18n";
-import { isGroupAnchor, planTranscriptRows, type ActivityPiece, type TranscriptRow } from "@/lib/chat-transcript-plan";
+import { collectToolResults, isGroupAnchor, planTranscriptRows, type ActivityPiece, type TranscriptRow } from "@/lib/chat-transcript-plan";
 import { resolveForkTargets } from "@/lib/chat-fork";
 import { MessageView } from "./MessageView";
 import { ChatInput, type ChatInputHandle } from "./ChatInput";
@@ -44,6 +44,8 @@ interface Props {
   newSessionCwd: string | null;
   newSessionWorkspace?: ReactNode;
   toolCallsDefaultCollapsed?: boolean;
+  /** "Expand thinking blocks by default": open each thinking block on mount. */
+  expandThinkingByDefault?: boolean;
   /** omp `hideThinkingBlock`: omit thinking from the transcript. */
   hideThinkingBlock?: boolean;
   onAgentEnd?: () => void;
@@ -233,52 +235,19 @@ function ProcessDetailsGroup({ messageCount, toolCallCount, children }: { messag
 
 type RenderMessage = (idx: number, options?: { attachRef?: boolean; keyPrefix?: string; messageOverride?: AgentMessage; showTimestamp?: boolean; sourceBlockIndices?: number[] }) => ReactNode;
 
-/** Render a folded activity run; consecutive tool calls cluster into one row. */
-function renderActivityPieces(messages: AgentMessage[], pieces: ActivityPiece[], renderMessage: RenderMessage): ReactNode[] {
-  const rendered: ReactNode[] = [];
-  let pendingToolCalls: Array<{ block: ToolCallContent; msgIdx: number }> = [];
-
-  const flushToolCalls = () => {
-    if (pendingToolCalls.length === 0) return;
-    const first = pendingToolCalls[0];
-    rendered.push(
-      renderMessage(first.msgIdx, {
-        attachRef: false,
-        keyPrefix: `activity-tools-${first.msgIdx}-${rendered.length}`,
-        messageOverride: { ...withAssistantBlocks(messages[first.msgIdx] as AssistantMessage, pendingToolCalls.map((c) => c.block), { omitUsage: true }), errorMessage: undefined },
-        showTimestamp: false,
-      }),
-    );
-    pendingToolCalls = [];
-  };
-
-  for (const piece of pieces) {
-    if (!piece.blocks) {
-      flushToolCalls();
-      rendered.push(renderMessage(piece.index, { attachRef: false, keyPrefix: "activity" }));
-      continue;
-    }
+/** Render a folded activity run exactly as it streamed: one entry per piece, never merged across messages. */
+export function renderActivityPieces(messages: AgentMessage[], pieces: ActivityPiece[], renderMessage: RenderMessage): ReactNode[] {
+  return pieces.map((piece, pieceIdx) => {
+    if (!piece.blocks) return renderMessage(piece.index, { attachRef: false, keyPrefix: "activity" });
     const msg = messages[piece.index] as AssistantMessage;
-    piece.blocks.forEach((block, bIdx) => {
-      if (block.type === "toolCall") {
-        pendingToolCalls.push({ block: block as ToolCallContent, msgIdx: piece.index });
-        return;
-      }
-      flushToolCalls();
-      rendered.push(
-        renderMessage(piece.index, {
-          attachRef: false,
-          keyPrefix: `activity-block-${piece.index}-${bIdx}`,
-          messageOverride: { ...withAssistantBlocks(msg, [block], { omitUsage: true }), errorMessage: undefined },
-          showTimestamp: false,
-          sourceBlockIndices: [msg.content.indexOf(block)],
-        }),
-      );
+    return renderMessage(piece.index, {
+      attachRef: false,
+      keyPrefix: `activity-${pieceIdx}`,
+      messageOverride: { ...withAssistantBlocks(msg, piece.blocks, { omitUsage: true }), errorMessage: undefined },
+      showTimestamp: false,
+      sourceBlockIndices: piece.blocks.map((block) => msg.content.indexOf(block)),
     });
-  }
-
-  flushToolCalls();
-  return rendered;
+  });
 }
 
 interface CommittedTranscriptProps {
@@ -302,6 +271,7 @@ interface CommittedTranscriptProps {
   onOpenFile?: (filePath: string) => void;
   sessionId: string | undefined;
   toolCallsDefaultCollapsed: boolean;
+  expandThinkingByDefault: boolean;
   hideThinkingBlock: boolean;
   visibleCount: number;
   /** True while the viewport is near the bottom of the conversation. When
@@ -322,7 +292,7 @@ interface CommittedTranscriptProps {
 const CommittedTranscript = memo(function CommittedTranscript({
   messages, entryIds, conversationMeta, messageRefs, isStreaming, sessionBusy, externalRunActive, isNew, forkingEntryId,
   handleFork, handleNavigate, handleEditContent, modelNames, messageCwd, onOpenFile, sessionId,
-  toolCallsDefaultCollapsed, hideThinkingBlock, visibleCount, nearBottom, sentinelRef, handleLoadMoreClick,
+  toolCallsDefaultCollapsed, expandThinkingByDefault, hideThinkingBlock, visibleCount, nearBottom, sentinelRef, handleLoadMoreClick,
 }: CommittedTranscriptProps) {
   const { t } = useI18n();
   const { toolResultsMap, lastAnchorIdx, visibleRefIndexByMessage } = conversationMeta;
@@ -379,6 +349,7 @@ const CommittedTranscript = memo(function CommittedTranscript({
         prevTimestamp={idx > 0 ? (messages[idx - 1] as AgentMessage & { timestamp?: number }).timestamp : undefined}
         sessionId={sessionId}
         toolCallsDefaultCollapsed={toolCallsDefaultCollapsed}
+        expandThinkingByDefault={expandThinkingByDefault}
         hideThinking={hideThinkingBlock}
         sourceBlockIndices={options.sourceBlockIndices}
       />
@@ -492,7 +463,7 @@ const CommittedTranscript = memo(function CommittedTranscript({
   );
 });
 
-export function ChatWindow({ session, newSessionCwd, newSessionWorkspace, toolCallsDefaultCollapsed = true, hideThinkingBlock = false, onAgentEnd, onSessionCreated, onSessionForked, modelsRefreshKey, chatInputRef, sessionInfoContainer, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsChange, onSessionStatsPanelOpen, onProviderUsageContextChange, onGenerationSpeedChange, onOpenFile, onOpenUrl, onOpenProviders }: Props) {
+export function ChatWindow({ session, newSessionCwd, newSessionWorkspace, toolCallsDefaultCollapsed = true, expandThinkingByDefault = false, hideThinkingBlock = false, onAgentEnd, onSessionCreated, onSessionForked, modelsRefreshKey, chatInputRef, sessionInfoContainer, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsChange, onSessionStatsPanelOpen, onProviderUsageContextChange, onGenerationSpeedChange, onOpenFile, onOpenUrl, onOpenProviders }: Props) {
   const { t, tn } = useI18n();
   const { playDoneSound, unlockAudio } = useAudio();
   const isMobile = useIsMobile();
@@ -858,14 +829,13 @@ export function ChatWindow({ session, newSessionCwd, newSessionWorkspace, toolCa
     return history.reverse();
   }, [messages]);
   const conversationMeta = useMemo(() => {
-    const toolResultsMap = new Map<string, ToolResultMessage>();
+    const toolResultsMap = collectToolResults(messages);
     let lastAnchorIdx = -1;
     let hasCompaction = false;
     const visibleRefIndexByMessage = new Map<number, number>();
     let refIdx = 0;
 
     messages.forEach((message, index) => {
-      if (message.role === "toolResult") toolResultsMap.set((message as ToolResultMessage).toolCallId, message as ToolResultMessage);
       if (message.role === "custom" && message.customType === "compaction") hasCompaction = true;
       if (isGroupAnchor(message)) lastAnchorIdx = index;
       if (message.role === "user" || message.role === "assistant") visibleRefIndexByMessage.set(index, refIdx++);
@@ -1311,6 +1281,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionWorkspace, toolCa
               onOpenFile={onOpenFile}
               sessionId={session?.id ?? sessionIdRef.current ?? undefined}
               toolCallsDefaultCollapsed={toolCallsDefaultCollapsed}
+              expandThinkingByDefault={expandThinkingByDefault}
               hideThinkingBlock={hideThinkingBlock}
               visibleCount={visibleCount}
               nearBottom={nearBottom}
@@ -1326,6 +1297,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionWorkspace, toolCa
                 onOpenFile={onOpenFile}
                 toolResults={toolResultsWithLive}
                 toolCallsDefaultCollapsed={toolCallsDefaultCollapsed}
+                expandThinkingByDefault={expandThinkingByDefault}
                 hideThinking={hideThinkingBlock}
                 liveTokensPerSecond={tokensPerSecond}
               />
@@ -1461,7 +1433,10 @@ export function ChatWindow({ session, newSessionCwd, newSessionWorkspace, toolCa
             <ExtensionWidgets widgets={belowEditorWidgets} />
           </div>
         </div>
-        {chatInputElement}
+        {/* An open ask is answered (or cancelled) in its panel; hiding the
+            composer leaves no doubt where to type. Kept mounted so the
+            draft, attachments and a recording survive. */}
+        <div style={{ display: extensionDialog?.method === "ask" ? "none" : "contents" }}>{chatInputElement}</div>
       </div>
       </>
       )}
