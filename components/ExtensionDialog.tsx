@@ -1,7 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, useSyncExternalStore, type CSSProperties, type RefObject } from "react";
-import { SendHorizontal } from "lucide-react";
+import { useEffect, useRef, useState, useSyncExternalStore, type RefObject } from "react";
 import type { ExtensionUiRequest } from "@/lib/types";
 import type { RpcAskDialogAnswer } from "@/lib/pi-types";
 import { useI18n } from "@/lib/i18n";
@@ -20,8 +19,10 @@ export type ExtensionDialogResponse =
   | { cancelled: true }
   | { answers: RpcAskDialogAnswer[] };
 
-type AskDraft = { selected: string[]; other: string };
-const EMPTY_ASK_DRAFT: AskDraft = { selected: [], other: "" };
+// The Other text lives as long as the question: choosing a regular option only
+// unchooses it, so the text is still in its row when Other is chosen again.
+type AskDraft = { selected: string[]; other: string; otherChosen: boolean };
+const EMPTY_ASK_DRAFT: AskDraft = { selected: [], other: "", otherChosen: false };
 
 // Keyboard-aware panel height. The on-screen keyboard shrinks the visible
 // area, so a panel sized against the layout viewport alone keeps its footer
@@ -86,8 +87,8 @@ function isKeyboardOpen(): boolean {
  * Per-panel soft-keyboard tracking for a composer-attached request, active
  * only while focus is inside the panel. A panel in the composer is not a
  * modal, so the browser is free to scroll the page when the keyboard opens;
- * this is what keeps the footer (Cancel / Submit) inside the visible area and
- * what reveals the inline send control (#236).
+ * this is what keeps the footer (Cancel / Submit) inside the visible area
+ * (#236).
  *
  * Two signals, because neither alone is enough: `visualViewport` shrinking is
  * the real keyboard (fingerprint-free), and a coarse pointer means the tap
@@ -156,32 +157,12 @@ function touchPointer(): boolean {
   return !window.matchMedia("(pointer: fine)").matches;
 }
 
-/** Corner control so a typed answer can be submitted without dismissing the
- * keyboard to reach the footer behind it. */
-function inlineSubmitStyle(disabled: boolean, touchTarget: boolean): CSSProperties {
-  return {
-    display: "inline-flex",
-    alignItems: "center",
-    justifyContent: "center",
-    padding: "7px 9px",
-    minWidth: touchTarget ? 44 : undefined,
-    minHeight: touchTarget ? 44 : undefined,
-    borderRadius: 7,
-    border: `1px solid ${disabled ? "var(--border)" : "var(--accent-strong)"}`,
-    background: disabled ? "var(--bg-subtle)" : "var(--accent-strong)",
-    color: disabled ? "var(--text-dim)" : "var(--on-accent)",
-    cursor: disabled ? "not-allowed" : "pointer",
-    opacity: disabled ? 0.65 : 1,
-    flexShrink: 0,
-  };
-}
-
 /** Single-select questions start on their recommended option. */
 function initialAskDrafts(request: ExtensionDialogRequest): AskDraft[] {
   if (request.method !== "ask") return [];
   return request.questions.map((question) => {
     const recommended = question.multi || question.recommended === undefined ? undefined : question.options[question.recommended];
-    return { selected: recommended ? [recommended.label] : [], other: "" };
+    return { selected: recommended ? [recommended.label] : [], other: "", otherChosen: false };
   });
 }
 
@@ -223,10 +204,15 @@ export function ExtensionDialog({
   }, [request]);
 
   const askDraftAt = (index: number) => askDrafts[index] ?? EMPTY_ASK_DRAFT;
-  // Multi-select may stay empty; single-select needs a choice or an answer.
+  const updateAskDraft = (index: number, update: (draft: AskDraft) => AskDraft) =>
+    setAskDrafts((drafts) => drafts.map((draft, i) => i === index ? update(draft) : draft));
+  // A chosen Other counts only with text. Multi-select may stay empty;
+  // single-select needs a choice or an answer.
   const canSubmit = request.method === "ask"
-    ? request.questions.every((question, index) =>
-      question.multi || askDraftAt(index).selected.length > 0 || askDraftAt(index).other.trim() !== "")
+    ? request.questions.every((question, index) => {
+      const { selected, other, otherChosen } = askDraftAt(index);
+      return question.multi || selected.length > 0 || (otherChosen && other.trim() !== "");
+    })
     : request.method !== "select" || selectedOption !== null;
   const title = request.method === "ask" ? t("chatWindow.askTitle") : request.title;
 
@@ -279,7 +265,7 @@ export function ExtensionDialog({
       onRespond(request, {
         answers: request.questions.map((question, index) => {
           const draft = askDraftAt(index);
-          const customInput = draft.other.trim();
+          const customInput = draft.otherChosen ? draft.other.trim() : "";
           return {
             id: question.id,
             selectedOptions: question.options.map((option) => option.label).filter((label) => draft.selected.includes(label)),
@@ -463,9 +449,9 @@ export function ExtensionDialog({
                             type={question.multi ? "checkbox" : "radio"}
                             name={`ask-${request.id}-${index}`}
                             checked={checked}
-                            onChange={() => setAskDrafts((drafts) => drafts.map((current, i) => i !== index ? current : question.multi
+                            onChange={() => updateAskDraft(index, (current) => question.multi
                               ? { ...current, selected: current.selected.includes(option.label) ? current.selected.filter((label) => label !== option.label) : [...current.selected, option.label] }
-                              : { selected: [option.label], other: "" }))}
+                              : { ...current, selected: [option.label], otherChosen: false })}
                             style={{ margin: "2px 0 0", accentColor: "var(--accent-strong)" }}
                           />
                           <span style={{ minWidth: 0, overflowWrap: "anywhere" }}>
@@ -483,48 +469,71 @@ export function ExtensionDialog({
                         </label>
                       );
                     })}
-                    <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+                    {/* The Other option: its text box is the option, so what was
+                        typed stays in place while another option is chosen. */}
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "flex-start",
+                        gap: 8,
+                        minWidth: 0,
+                        padding: "8px 10px",
+                        borderRadius: 7,
+                        border: `1px solid ${draft.otherChosen ? "var(--accent)" : "var(--border)"}`,
+                        background: draft.otherChosen ? "color-mix(in srgb, var(--accent) 10%, var(--bg-panel))" : "var(--bg-panel)",
+                      }}
+                    >
+                      <input
+                        type={question.multi ? "checkbox" : "radio"}
+                        name={`ask-${request.id}-${index}`}
+                        aria-label={t("chatWindow.askOther")}
+                        checked={draft.otherChosen}
+                        onChange={(e) => {
+                          const chosen = e.target.checked;
+                          updateAskDraft(index, (current) => ({ ...current, selected: chosen && !question.multi ? [] : current.selected, otherChosen: chosen }));
+                          if (chosen) document.getElementById(`ask-${request.id}-${index}-other`)?.focus();
+                        }}
+                        style={{ margin: "4px 0 0", accentColor: "var(--accent-strong)", cursor: "pointer" }}
+                      />
                       <textarea
+                        id={`ask-${request.id}-${index}-other`}
                         aria-label={t("chatWindow.askOther")}
                         placeholder={t("chatWindow.askOther")}
                         value={draft.other}
-                        rows={2}
+                        // Going back into kept text means answering with it again.
+                        onFocus={() => {
+                          if (draft.otherChosen || !draft.other.trim()) return;
+                          updateAskDraft(index, (current) => ({ ...current, selected: question.multi ? current.selected : [], otherChosen: true }));
+                        }}
+                        rows={1}
                         onChange={(e) => {
                           const other = e.target.value;
-                          setAskDrafts((drafts) => drafts.map((current, i) => i === index ? { selected: question.multi ? current.selected : [], other } : current));
+                          // Typing chooses Other (replacing a single-select choice);
+                          // clearing it unchooses, so a blank answer never blocks Submit.
+                          updateAskDraft(index, (current) => other.trim()
+                            ? { selected: question.multi ? current.selected : [], other, otherChosen: true }
+                            : { ...current, other, otherChosen: false });
                         }}
                         onKeyDown={(e) => {
                           if ((e.metaKey || e.ctrlKey) && e.key === "Enter") submitValue();
                         }}
                         style={{
-                          width: "100%",
-                          boxSizing: "border-box",
+                          flex: 1,
                           minWidth: 0,
-                          padding: "8px 10px",
-                          borderRadius: 7,
-                          border: "1px solid var(--border)",
-                          background: "var(--bg-panel)",
-                          color: "var(--text)",
+                          padding: 0,
+                          border: "none",
+                          background: "none",
+                          color: draft.otherChosen ? "var(--text)" : "var(--text-muted)",
                           outline: "none",
-                          resize: "vertical",
+                          resize: "none",
                           fontSize: "var(--chat-font-size)",
                           lineHeight: 1.55,
                           fontFamily: "inherit",
+                          fieldSizing: "content",
+                          minHeight: "1.55em",
+                          maxHeight: 200,
                         }}
                       />
-                      {keyboardOpen && (
-                        <button
-                          type="button"
-                          onClick={submitValue}
-                          disabled={!canSubmit}
-                          title={t("chatWindow.askSubmitAnswer")}
-                          aria-label={t("chatWindow.askSubmitAnswer")}
-                          className="extension-dialog-send"
-                          style={inlineSubmitStyle(!canSubmit, touchTargets === "accessible")}
-                        >
-                          <SendHorizontal size={15} strokeWidth={2} aria-hidden="true" />
-                        </button>
-                      )}
                     </div>
                   </fieldset>
                 );
