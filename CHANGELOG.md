@@ -6,6 +6,10 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ## Unreleased
 
+### Breaking changes
+
+- **omp-web now requires Node.js 24 or newer** (the current LTS). `ompweb` and its service and tray commands (`ompweb-systemd`, `ompweb-launchd`, `ompweb-tray`, `ompweb-tray-linux`) refuse older versions before doing anything.
+
 ---
 
 ## [v0.5.2] - 2026-10-11
