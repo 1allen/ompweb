@@ -108,6 +108,17 @@ export function getTooltipTopPx(displayIndex: number, railScrollTop = 0): number
  * while every row was visible at once, which fixed-height rows no
  * longer guarantee.
  */
+/**
+ * Whether the rail actually overflows, so the active row only gets
+ * scrolled into view when it could sit outside the visible rail
+ * (#251 follow-up). A row-count guard misses short viewports: 15
+ * fixed-height rows already need 282px, more than a <376px viewport's
+ * 75vh cap, so the rail can overflow with far fewer than 16 rows.
+ */
+export function railOverflows(scrollHeight: number, clientHeight: number): boolean {
+  return scrollHeight > clientHeight;
+}
+
 export function railIndexForPointer(relY: number, railScrollTop: number, nodeCount: number): number {
   if (nodeCount <= 0) return 0;
   const contentY = railScrollTop + relY;
@@ -285,9 +296,9 @@ export const ChatMinimap = memo(function ChatMinimap({ messages, scrollContainer
     return () => ro.disconnect();
   }, [scrollContainer]);
 
-  // Keep active row visible within the rail when node count overflows
+  // Keep active row visible within the rail when the rail overflows
   useEffect(() => {
-    if (railRef.current && nodes.length > 15) {
+    if (railRef.current && railOverflows(railRef.current.scrollHeight, railRef.current.clientHeight)) {
       const activeRow = railRef.current.querySelector(`[data-index="${activeIndex}"]`) as HTMLElement | null;
       activeRow?.scrollIntoView({ block: "nearest", behavior: reducedMotion ? "auto" : "smooth" });
     }

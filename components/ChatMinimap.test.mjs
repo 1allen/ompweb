@@ -8,7 +8,7 @@ const jiti = createJiti(import.meta.url, {
   jsx: { runtime: "automatic" },
   tsconfigPaths: true,
 });
-const { ChatMinimap, extractPreviewText, getBarWidth, getTooltipTopPx, railIndexForPointer } = await jiti.import("./ChatMinimap.tsx");
+const { ChatMinimap, extractPreviewText, getBarWidth, getTooltipTopPx, railIndexForPointer, railOverflows } = await jiti.import("./ChatMinimap.tsx");
 
 test("extractPreviewText extracts clean text from user string content", () => {
   const preview = extractPreviewText({
@@ -150,4 +150,11 @@ test("rail is always scrollable, even with few rows on a short viewport (#251 fo
     })
   );
   assert.match(html, /overflow-y:auto/);
+});
+
+test("active-row scroll is gated on actual rail overflow, not row count (#251 follow-up)", () => {
+  // 15 rows on a short viewport: content 282px > 250px viewport cap.
+  assert.equal(railOverflows(282, 250), true);
+  assert.equal(railOverflows(282, 282), false);
+  assert.equal(railOverflows(200, 520), false);
 });
