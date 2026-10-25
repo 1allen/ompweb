@@ -8,7 +8,7 @@ const jiti = createJiti(import.meta.url, {
   jsx: { runtime: "automatic" },
   tsconfigPaths: true,
 });
-const { ChatMinimap, extractPreviewText, getBarWidth, getTooltipTopPx } = await jiti.import("./ChatMinimap.tsx");
+const { ChatMinimap, extractPreviewText, getBarWidth, getTooltipTopPx, railIndexForPointer } = await jiti.import("./ChatMinimap.tsx");
 
 test("extractPreviewText extracts clean text from user string content", () => {
   const preview = extractPreviewText({
@@ -127,4 +127,27 @@ test("rail rows do not shrink below the row height (#251)", () => {
   );
   assert.match(html, /flex-shrink:0/);
   assert.match(html, /min-height:18px/);
+});
+
+test("drag scrubber maps a pointer to the row actually under it when scrolled (#251 follow-up)", () => {
+  // Unscrolled: pointer at the center of row 20 (6 + 20*18 + 9 = 375).
+  assert.equal(railIndexForPointer(375, 0, 86), 20);
+  // Scrolled by 594px: a viewport offset of 15px lands at content
+  // 609, i.e. row 33 ((609 - 6) / 18 = 33.5, floored).
+  assert.equal(railIndexForPointer(15, 594, 86), 33);
+  // Clamped at both ends.
+  assert.equal(railIndexForPointer(-10, 0, 86), 0);
+  assert.equal(railIndexForPointer(9999, 0, 86), 85);
+});
+
+test("rail is always scrollable, even with few rows on a short viewport (#251 follow-up)", () => {
+  const messages = [{ role: "user", content: "only prompt" }];
+  const html = renderToStaticMarkup(
+    React.createElement(ChatMinimap, {
+      messages,
+      scrollContainer: { current: null },
+      messageRefs: { current: [] },
+    })
+  );
+  assert.match(html, /overflow-y:auto/);
 });

@@ -99,6 +99,22 @@ export function getTooltipTopPx(displayIndex: number, railScrollTop = 0): number
   return 6 + displayIndex * ROW_HEIGHT + ROW_HEIGHT / 2 - railScrollTop;
 }
 
+/**
+ * Row index under a drag pointer, in a rail whose rows are fixed-height
+ * and may be scrolled (#251 follow-up). The pointer's viewport offset
+ * inside the rail plus the rail's scroll offset gives its position in
+ * the rail's content, where row i starts at 6 + i * ROW_HEIGHT (6px
+ * top padding). The old ratio-over-visible-height mapping only worked
+ * while every row was visible at once, which fixed-height rows no
+ * longer guarantee.
+ */
+export function railIndexForPointer(relY: number, railScrollTop: number, nodeCount: number): number {
+  if (nodeCount <= 0) return 0;
+  const contentY = railScrollTop + relY;
+  const index = Math.floor((contentY - 6) / ROW_HEIGHT);
+  return Math.max(0, Math.min(nodeCount - 1, index));
+}
+
 export const ChatMinimap = memo(function ChatMinimap({ messages, scrollContainer, messageRefs }: Props) {
   const [activeIndex, setActiveIndex] = useState(0);
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
@@ -287,8 +303,7 @@ export const ChatMinimap = memo(function ChatMinimap({ messages, scrollContainer
       if (!railEl) return;
       const rect = railEl.getBoundingClientRect();
       const relY = clientY - rect.top;
-      const ratio = Math.max(0, Math.min(1, relY / rect.height));
-      const targetIdx = Math.min(nodes.length - 1, Math.floor(ratio * nodes.length));
+      const targetIdx = railIndexForPointer(relY, railEl.scrollTop, nodes.length);
       if (nodes[targetIdx]) {
         scrollToNodeRef.current(nodes[targetIdx], false);
         setActiveIndex(targetIdx);
@@ -396,7 +411,11 @@ export const ChatMinimap = memo(function ChatMinimap({ messages, scrollContainer
           alignItems: "flex-start",
           padding: "6px 6px 6px 8px",
           maxHeight: "min(75vh, 520px)",
-          overflowY: nodes.length > 25 ? "auto" : "visible",
+          // Always scrollable: with fixed-height rows, even 25 or fewer
+          // rows can exceed a short viewport's 75vh cap, and "visible"
+          // would then spill them out of the rail with no way to reach
+          // them (#251 follow-up). scrollbarWidth none keeps it clean.
+          overflowY: "auto",
           scrollbarWidth: "none",
           cursor: "pointer",
         }}
