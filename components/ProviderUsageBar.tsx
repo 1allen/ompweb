@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { Check, ChevronRight, Gauge, RefreshCw } from "lucide-react";
 import { useI18n } from "@/lib/i18n";
-import { formatUsageReset, usageTone, useProviderUsage } from "./AppShell-provider-usage";
+import { formatUsageReset, usageBucketLabel, usageTone, useProviderUsage } from "./AppShell-provider-usage";
 import type { ProviderUsageReport, ProviderUsageWindow } from "@/lib/provider-usage-types";
 import { SidebarIconButton } from "./SessionSidebar-chrome";
 import { Tooltip } from "./ui/primitives";
@@ -274,7 +274,8 @@ export function ProviderUsageBar() {
       </div>
       {!collapsed && reports.map((report, index) => {
         const account = report.accountLabel ?? t("appShell.account", { number: report.accountIndex ?? index + 1 });
-        const key = `${report.provider}:${account}:${report.modelId ?? "all"}:${index}`;
+        const bucketLabel = usageBucketLabel(report);
+        const key = `${report.provider}:${account}:${report.modelId ?? "all"}:${report.tier ?? ""}:${report.bucket ?? ""}:${index}`;
         const best = displayWindowForReport(report, displayWindow);
         const expanded = expandedKey === key;
         const pct = best ? Math.round(best.window.percent) : 0;
@@ -285,7 +286,7 @@ export function ProviderUsageBar() {
               type="button"
               onClick={() => setExpandedKey((prev) => (prev === key ? null : key))}
               aria-expanded={report.noLimits ? undefined : expanded}
-              title={account}
+              title={bucketLabel ? `${account} (${bucketLabel})` : account}
               style={{
                 display: "flex",
                 alignItems: "center",
@@ -316,6 +317,11 @@ export function ProviderUsageBar() {
               <span style={{ fontFamily: "var(--font-mono)", fontWeight: 700, fontSize: 10, color: "var(--text)", background: "var(--bg)", border: "1px solid var(--border)", padding: "0 5px", borderRadius: 4, whiteSpace: "nowrap", flexShrink: 0, lineHeight: 1.7 }}>
                 {report.provider}
               </span>
+              {bucketLabel && (
+                <span style={{ fontFamily: "var(--font-mono)", fontWeight: 700, fontSize: 10, color: "var(--text-muted)", background: "var(--bg-subtle)", border: "1px solid var(--border)", padding: "0 5px", borderRadius: 4, whiteSpace: "nowrap", flexShrink: 0, lineHeight: 1.7 }}>
+                  {bucketLabel}
+                </span>
+              )}
               <span style={{ fontSize: 11, color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, minWidth: 0 }}>
                 {account}
               </span>
