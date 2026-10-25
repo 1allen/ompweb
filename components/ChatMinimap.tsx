@@ -85,10 +85,25 @@ export function getBarWidth(text: string, isActive: boolean, isHovered: boolean)
 
 const ROW_HEIGHT = 18;
 
+/**
+ * Vertical center of a rail row's tooltip, in the unclipped outer
+ * container's coordinates. The rail is a flex column whose rows used to
+ * shrink below ROW_HEIGHT once the list exceeded the rail's max-height,
+ * so a tooltip positioned purely from the index drifted below its row
+ * and eventually out of view (#251). Rows are now non-shrinking (see the
+ * row style below), so the rail scrolls instead of compressing; the only
+ * correction left is the rail's own scroll offset, which is 0 while the
+ * rail fits and otherwise moves the visible row up by exactly that much.
+ */
+export function getTooltipTopPx(displayIndex: number, railScrollTop = 0): number {
+  return 6 + displayIndex * ROW_HEIGHT + ROW_HEIGHT / 2 - railScrollTop;
+}
+
 export const ChatMinimap = memo(function ChatMinimap({ messages, scrollContainer, messageRefs }: Props) {
   const [activeIndex, setActiveIndex] = useState(0);
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   const [isRailHovered, setIsRailHovered] = useState(false);
+  const [railScrollTop, setRailScrollTop] = useState(0);
   const railRef = useRef<HTMLDivElement>(null);
   const draggingRef = useRef(false);
   const scrollRafRef = useRef<number | null>(null);
@@ -313,7 +328,7 @@ export const ChatMinimap = memo(function ChatMinimap({ messages, scrollContainer
   const displayTooltipIndex = hoveredIndex !== null ? hoveredIndex : (isRailHovered ? activeIndex : null);
   const tooltipNode = displayTooltipIndex !== null ? nodes[displayTooltipIndex] : null;
   // Calculate unclipped vertical center position for the tooltip
-  const tooltipTopPx = displayTooltipIndex !== null ? 6 + displayTooltipIndex * ROW_HEIGHT + ROW_HEIGHT / 2 : 0;
+  const tooltipTopPx = displayTooltipIndex !== null ? getTooltipTopPx(displayTooltipIndex, railScrollTop) : 0;
 
   return (
     <div
@@ -372,6 +387,7 @@ export const ChatMinimap = memo(function ChatMinimap({ messages, scrollContainer
           setIsRailHovered(false);
           setHoveredIndex(null);
         }}
+        onScroll={(e) => setRailScrollTop(e.currentTarget.scrollTop)}
         onMouseDown={handleMouseDown}
         style={{
           position: "relative",
@@ -431,6 +447,12 @@ export const ChatMinimap = memo(function ChatMinimap({ messages, scrollContainer
                 display: "flex",
                 alignItems: "center",
                 height: ROW_HEIGHT,
+                // Rows must not shrink: with maxHeight + overflowY auto the
+                // rail is meant to scroll past ~25 entries, but the flex
+                // default (flexShrink 1) compressed every row to ~520/N
+                // instead, which is what broke tooltip alignment (#251).
+                flexShrink: 0,
+                minHeight: ROW_HEIGHT,
                 paddingLeft: 6,
                 paddingRight: 8,
                 cursor: "pointer",
