@@ -6,6 +6,10 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ## Unreleased
 
+### Added
+
+- New sessions get a title on their own. omp does not name sessions in RPC mode ([can1357/oh-my-pi#14616](https://github.com/can1357/oh-my-pi/issues/14616)), so they stayed untitled until **Generate title** was clicked. After a reply finishes, omp-web now asks omp's title generator to name an untitled session, the way omp's terminal UI does. omp skips a bare greeting, so a later reply in the same session tries again, up to three times. The request runs in the background: the chat shows no run and none of `/rename`'s output, and a title you set yourself is never replaced.
+
 ### Fixes & Improvements
 
 - Fix test fixtures on macOS and paths containing spaces: report the actual tray platform, launch the transcription gateway stub with the exact quoted Node executable, and separate deterministic known-path cache invalidation from native filesystem-watch delivery without weakening authorization or content assertions.
