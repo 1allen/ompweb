@@ -146,8 +146,13 @@ function normalizeReport(
 
   const selectedGroups = [...groups.values()];
   if (activeModelId && selectedGroups.length > 0) {
-    const selected = selectedGroups.reduce((best, group) => group.priority < best.priority ? group : best);
-    selectedGroups.splice(0, selectedGroups.length, selected);
+    // Keep every group tied at the best priority, not just the first:
+    // Antigravity's Gemini and shared buckets share priority (no modelId,
+    // no tier) and differ only by bucket, so picking one would drop a
+    // quota bucket from a model-filtered query (#284, CodeRabbit).
+    const bestPriority = Math.min(...selectedGroups.map((group) => group.priority));
+    const kept = selectedGroups.filter((group) => group.priority === bestPriority);
+    selectedGroups.splice(0, selectedGroups.length, ...kept);
   }
   const metadata = isRecord(rawReport.metadata) ? rawReport.metadata : undefined;
   // Email only: unredacted account ids are opaque UUIDs, so those accounts
