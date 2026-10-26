@@ -17,6 +17,15 @@ import { Archive, ArrowDownUp, ArrowLeft, ArrowRight, Check, ChevronRight, FileU
 import { publishSessionsChanged } from "@/lib/session-change-bus";
 import { openEventStream } from "@/lib/event-stream";
 import {
+  loadRecentRuns,
+  recordCompletedRun,
+  removeActiveFromCompleted,
+  saveRecentRuns,
+  seedRecentRuns,
+  type RecentRunEntry,
+} from "@/lib/recent-runs";
+import { useRecentRunsLimit } from "@/hooks/useRecentRunsLimit";
+import {
   EMPTY_PROJECT_SET,
   INITIAL_RESTORE_MAX_ATTEMPTS,
   INITIAL_RESTORE_RETRY_MS,
@@ -130,7 +139,38 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   const [runningSessionCwds, setRunningSessionCwds] = useState<Record<string, string>>({});
   const [exitedSessions, setExitedSessions] = useState<Map<string, ExitedRpcSession>>(() => new Map());
   const knownRunningCwdsRef = useRef<Map<string, string>>(new Map());
+  const { limit: recentRunsLimit } = useRecentRunsLimit();
   const [unreadSessionIds, setUnreadSessionIds] = useState<Set<string>>(() => loadUnreadSessionIds());
+  const [recentCompletedRuns, setRecentCompletedRuns] = useState<RecentRunEntry[]>(() => loadRecentRuns());
+  const effectiveRecentCompletedSet = useMemo(() => {
+    const timestampMap = new Map<string, number>();
+
+    // 1. Live and persisted recent completed runs
+    for (const r of recentCompletedRuns) {
+      if (!runningSessionIds.has(r.sessionId)) {
+        timestampMap.set(r.sessionId, r.completedAt);
+      }
+    }
+
+    // 2. On-disk active sessions (fallback & recency backfill)
+    for (const s of allSessions) {
+      if (runningSessionIds.has(s.id)) continue;
+      const isValid = (s.firstMessage && s.firstMessage !== "(no messages)") || s.messageCount > 0 || Boolean(s.name);
+      if (!isValid) continue;
+      const ts = new Date(s.modified).getTime();
+      const existing = timestampMap.get(s.id);
+      if (existing === undefined || ts > existing) {
+        timestampMap.set(s.id, ts);
+      }
+    }
+
+    // Sort by latest timestamp descending, pick top dynamic limit
+    const sorted = [...timestampMap.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, recentRunsLimit);
+
+    return new Set(sorted.map(([id]) => id));
+  }, [recentCompletedRuns, allSessions, runningSessionIds, recentRunsLimit]);
   const previousRunningSessionIdsRef = useRef<Set<string>>(new Set());
   // Relative session times must age while the sidebar stays open; one shared
   // minute clock avoids a timer per session row.
@@ -265,6 +305,24 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   useEffect(() => {
     saveUnreadSessionIds(unreadSessionIds);
   }, [unreadSessionIds]);
+  useEffect(() => {
+    saveRecentRuns(recentCompletedRuns, undefined, recentRunsLimit);
+  }, [recentCompletedRuns, recentRunsLimit]);
+
+  useEffect(() => {
+    if (allSessions.length === 0) return;
+    setRecentCompletedRuns((prev) => {
+      const seeded = seedRecentRuns(allSessions, recentRunsLimit);
+      if (prev.length === 0) return seeded;
+      const newestPrev = Math.max(...prev.map((p) => p.completedAt), 0);
+      const newestSeeded = Math.max(...seeded.map((s) => s.completedAt), 0);
+      if (newestSeeded > newestPrev) {
+        return seeded;
+      }
+      return prev;
+    });
+  }, [allSessions, recentRunsLimit]);
+
 
   // Debounce refresh bursts (agent_start + session_info_update + file-appear signal can fire within 250ms)
   const pendingRefreshRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -350,8 +408,22 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
 
   useEffect(() => {
     const previous = previousRunningSessionIdsRef.current;
-    const completedInBackground = [...previous].filter((id) => !runningSessionIds.has(id) && id !== selectedSessionId);
+    const allCompleted = [...previous].filter((id) => !runningSessionIds.has(id));
+    const completedInBackground = allCompleted.filter((id) => id !== selectedSessionId);
     const newlyRunning = [...runningSessionIds].filter((id) => !previous.has(id));
+
+    if (allCompleted.length > 0 || newlyRunning.length > 0) {
+      setRecentCompletedRuns((prev) => {
+        let updated = prev;
+        if (newlyRunning.length > 0) {
+          updated = removeActiveFromCompleted(updated, runningSessionIds);
+        }
+        for (const id of allCompleted) {
+          updated = recordCompletedRun(updated, id, undefined, recentRunsLimit);
+        }
+        return updated;
+      });
+    }
 
     if (completedInBackground.length > 0 || newlyRunning.length > 0) {
       setUnreadSessionIds((prev) => {
@@ -371,7 +443,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     }
 
     previousRunningSessionIdsRef.current = runningSessionIds;
-  }, [runningSessionIds, selectedSessionId, loadSessions]);
+  }, [runningSessionIds, selectedSessionId, loadSessions, recentRunsLimit]);
 
   useEffect(() => {
     if (!selectedSessionId) return;
@@ -775,7 +847,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     const entries: { project: ManagedProject; sessions: SessionInfo[]; scores?: Map<string, number>; rank: number }[] = [];
     for (const project of sortedProjects) {
       let list = sessionsByProject.get(project.path) ?? [];
-      if (runningOnly) list = list.filter((s) => runningSessionIds.has(s.id));
+      if (runningOnly) list = list.filter((s) => runningSessionIds.has(s.id) || effectiveRecentCompletedSet.has(s.id));
       if (!query) {
         if (list.length === 0 && runningOnly) continue;
         entries.push({ project, sessions: list, rank: 0 });
@@ -799,7 +871,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     // Best match first; ties keep the workspace order (stable sort).
     if (query) entries.sort((a, b) => b.rank - a.rank);
     return entries;
-  }, [sortedProjects, sessionsByProject, runningOnly, trimmedSearchQuery, currentTranscriptSearch, runningSessionIds]);
+  }, [sortedProjects, sessionsByProject, runningOnly, trimmedSearchQuery, currentTranscriptSearch, runningSessionIds, effectiveRecentCompletedSet]);
 
   const treesByProject = useMemo(() => {
     const m = new Map<string, ReturnType<typeof buildSessionTree>>();
@@ -1445,7 +1517,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
         </SidebarPortalMenu>
         <SidebarIconButton
           label={t("sessionSidebar.filterRunning")}
-          title={t("sessionSidebar.filterRunningTitle")}
+          title={t("sessionSidebar.filterRunningTitle", { count: recentRunsLimit })}
           active={runningOnly}
           onClick={() => setRunningOnly((v) => !v)}
         >
@@ -1575,6 +1647,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
                 runningSessionIds={runningSessionIds}
                 unreadSessionIds={unreadSessionIds}
                 exitedSessions={exitedSessions}
+                recentlyCompletedIds={effectiveRecentCompletedSet}
                 relativeTimeNow={relativeTimeNow}
                 onActivate={activateProject}
                 onToggleExpand={toggleProjectExpanded}
