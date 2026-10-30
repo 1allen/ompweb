@@ -1158,6 +1158,126 @@ test("a finished reply stays on screen until its saved copy replaces it", async 
   assert.equal(w.latest.streamState.streamingMessage, null, "the held reply gives way to its saved copy");
 });
 
+for (const forkAt of ["none", "startup", "write"]) {
+  test(`resuming with ${forkAt} identity change sends and streams on the actual identity`, async () => {
+    resetWorld();
+    const originalId = "resume-parent";
+    const forkOnResume = forkAt !== "none";
+    const actualId = forkOnResume ? "resume-child" : originalId;
+    const history = [userMsg("u0", "loaded question")];
+    primeSession(originalId, history);
+    if (forkOnResume) primeSession(actualId, history);
+    const moved = [];
+    const created = [];
+    const w = await mountSession(originalId, undefined, {
+      onSessionMoved: (oldId, newId) => moved.push([oldId, newId]),
+      onSessionCreated: (session) => created.push(session.id),
+    });
+    await act(async () => { w.latest.handleAdvisorChange(true); });
+    world.holds.push({
+      match: (method, url) => method === "POST" && url.startsWith(`/api/agent/${originalId}`)
+        && world.calls.at(-1).body?.type === (forkAt === "write" ? "prompt" : "get_state"),
+      produce: async () => ({
+        value: { success: true, sessionId: actualId, data: { sessionId: actualId } },
+      }),
+    });
+
+    let send;
+    await act(async () => {
+      send = w.latest.handleSend("reply in the resumed conversation");
+      await sleep(30);
+    });
+    const initialEs = lastEs();
+    const dispatchId = forkAt === "startup" ? actualId : originalId;
+    assert.equal(initialEs.channel.sessionId, dispatchId);
+    await act(async () => {
+      initialEs.open();
+      assert.deepEqual(await send, { status: "accepted" });
+    });
+    assert.equal(w.latest.sessionIdRef.current, actualId);
+    assert.deepEqual(moved, forkOnResume ? [[originalId, actualId]] : []);
+    assert.deepEqual(created, [], "adoption offers the move path, not the created path");
+    const es = lastEs();
+    assert.equal(es.channel.sessionId, actualId);
+    if (forkAt === "write") {
+      assert.equal(initialEs.closedByCaller, true);
+      await act(async () => { es.open(); });
+    }
+    const prompts = world.calls.filter((call) => call.method === "POST" && call.body?.type === "prompt");
+    assert.equal(prompts.length, 1);
+    assert.equal(prompts[0].url, `/api/agent/${dispatchId}?advisor=1`);
+    assert.ok(world.calls.some((call) => call.url === `/api/sessions/${dispatchId}/context?boundary=1`));
+    assert.equal(w.latest.notices.some((notice) => notice.message.includes("separate fork")), forkOnResume);
+
+    await act(async () => {
+      es.emit({ type: "agent_start" });
+      es.emit({ type: "message_end", message: userMsg("u1", "reply in the resumed conversation") });
+      es.emit({ type: "message_end", message: assistantMsg("a1", "resumed reply") });
+      es.emit({ type: "agent_end", isTerminal: true });
+    });
+    await settle();
+    assert.equal(w.latest.agentRunning, false);
+    assert.equal(w.latest.messages.at(-1).content[0].text, "resumed reply");
+    if (forkOnResume) {
+      assert.deepEqual(world.sessions.get(originalId).messages, history, "the terminal conversation is not written");
+      assert.equal(localStorage.getItem(`omp-advisor-enabled:${actualId}`), "true");
+    }
+  });
+}
+
+for (const discoveredBy of ["event", "gauge"]) {
+  test(`a fork created after the prompt acknowledgment is adopted through ${discoveredBy}`, async () => {
+    resetWorld();
+    const history = [userMsg("u0", "original question")];
+    primeSession("late-parent", history);
+    const moved = [];
+    const created = [];
+    const { w, es: originalStream } = await startRun("late-parent", "continue", false, {
+      onSessionMoved: (oldId, newId) => moved.push([oldId, newId]),
+      onSessionCreated: (session) => created.push(session.id),
+    });
+    assert.equal(w.latest.sessionIdRef.current, "late-parent", "the prompt acknowledgment precedes the fork");
+    assert.deepEqual(moved, []);
+
+    // Native processing forks and saves its reply only after the POST has
+    // already acknowledged the original id. The next GET may discover and
+    // rekey it before any slower reconciliation request runs.
+    primeSession("late-child", [...history, userMsg("u1", "continue"), assistantMsg("a1", "late fork reply")]);
+    if (discoveredBy === "event") {
+      await act(async () => {
+        originalStream.emit({
+          type: "session_identity_changed",
+          previousSessionId: "late-parent",
+          sessionId: "late-child",
+        });
+      });
+    } else {
+      world.holds.push({
+        match: (method, url) => method === "GET" && url === "/api/agent/late-parent",
+        produce: async () => {
+          world.agents.set("late-parent", { running: false, state: {} });
+          return {
+            value: { running: true, state: { sessionId: "late-child", isStreaming: false, isPromptRunning: false, responseObserved: true } },
+          };
+        },
+      });
+      await settle(2100);
+    }
+
+    assert.equal(w.latest.sessionIdRef.current, "late-child");
+    assert.deepEqual(moved, [["late-parent", "late-child"]]);
+    assert.deepEqual(created, [], "adoption offers the move path, not the created path");
+    assert.equal(originalStream.closedByCaller, true);
+    const childStream = lastEs();
+    assert.equal(childStream.channel.sessionId, "late-child");
+    await act(async () => { childStream.open(); });
+    await settle();
+    assert.equal(w.latest.messages.at(-1).content[0].text, "late fork reply");
+    assert.deepEqual(world.sessions.get("late-parent").messages, history);
+    assert.equal(world.calls.filter((call) => call.body?.type === "prompt").length, 1, "adoption does not resend the accepted prompt");
+  });
+}
+
 test("provider error on the assistant message is shown instead of ending silently", async () => {
   resetWorld();
   primeSession("s1", [userMsg("u0", "q")]);

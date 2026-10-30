@@ -55,6 +55,7 @@
   "agentSession.reloadedResources": "已重新加载会话资源",
   "agentSession.responseFailed": "智能体在未返回响应的情况下停止了。请重试；如果问题持续，请检查提供商配置。",
   "agentSession.sendFailed": "发送消息失败：{detail}",
+  "agentSession.resumedAsFork": "OMP 已在独立分叉中继续此对话。新消息将发送到此网页对话，原始会话保持不变。",
   "agentSession.sessionRenamed": "会话已重命名为 {name}",
   "agentSession.shellSessionFailed": "无法为 shell 命令创建会话",
   "agentSession.queuedPromotionUnavailable": "该后续消息已不在队列中，无法转为引导消息。",

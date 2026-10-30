@@ -175,6 +175,7 @@ export interface LastAssistantTextResponse {
 
 // Shape of lib/rpc-manager's WebSessionState as seen over HTTP.
 export type AgentStateResponse = {
+  sessionId?: string;
   // Raw get_state passthrough: the resolved model omp is actually running.
   model?: { provider: string; id: string; name?: string; reasoning?: boolean; thinking?: { efforts?: string[] } };
   contextUsage?: { percent: number | null; contextWindow: number; tokens: number | null } | null;

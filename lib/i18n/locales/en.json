@@ -55,6 +55,7 @@
   "agentSession.reloadedResources": "Reloaded session resources",
   "agentSession.responseFailed": "The agent stopped without returning a response. Please retry and check the provider configuration if this continues.",
   "agentSession.sendFailed": "Failed to send message: {detail}",
+  "agentSession.resumedAsFork": "OMP continued this conversation in a separate fork. New messages go to this web conversation; the original session is unchanged.",
   "agentSession.sessionRenamed": "Session renamed to {name}",
   "agentSession.shellSessionFailed": "Unable to create a session for the shell command",
   "agentSession.queuedPromotionUnavailable": "The queued follow-up is no longer available to steer.",
