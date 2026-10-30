@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { readSessionHeader } from "@/lib/session-reader";
 import { apiErrorResponse, resolveSessionPathOr404 } from "@/lib/api-utils";
-import { startRpcSession, getRpcSession, resolveSpawnCwdResult, WebRpcError } from "@/lib/rpc-manager";
+import { startRpcSession, getRpcSession, resolveSpawnCwdResult, WebRpcError, type AgentSessionWrapper } from "@/lib/rpc-manager";
 import { RpcCommandError } from "@/lib/omp/rpc-process";
 import { parseJsonWithinLimit, RequestBodyTooLargeError } from "@/lib/bounded-form-data";
 import { MAX_AGENT_COMMAND_REQUEST_BYTES } from "@/lib/image-attachments";
@@ -43,6 +43,21 @@ function commandErrorResponse(error: unknown) {
   return apiErrorResponse(error);
 }
 
+async function sendCommandResponse(session: AgentSessionWrapper, body: Record<string, unknown>, type: string) {
+  const result = await session.send(body);
+  // OMP may defer an ownership fork until the first write, after startup's
+  // get_state still reported the terminal's id. Refresh after mutating commands
+  // so the response and registry identify the process that accepted the write.
+  if (!type.startsWith("get_") && !type.startsWith("predict_")) {
+    try {
+      await session.send({ type: "get_state" });
+    } catch {
+      // A failed refresh must not turn an accepted command into a retryable failure.
+    }
+  }
+  return NextResponse.json({ success: true, sessionId: session.sessionId, data: result });
+}
+
 // POST /api/agent/[id] - Send a command to an existing session
 export async function POST(
   req: Request,
@@ -70,12 +85,11 @@ export async function POST(
     const liveOnly = LIVE_SESSION_ONLY.has(body.type);
     if (existing?.isAlive()) {
       if (noSpawn || liveOnly || existing.advisorSpawned === advisor || existing.isRunning() || existing.isEditingHistory()) {
-        const result = await existing.send(body);
-        return NextResponse.json({ success: true, data: result });
+        return await sendCommandResponse(existing, body, body.type);
       }
       await existing.destroyAndWait();
     }
-    if (noSpawn) return NextResponse.json({ success: true, data: NO_SPAWN_REPLIES[body.type] });
+    if (noSpawn) return NextResponse.json({ success: true, sessionId: id, data: NO_SPAWN_REPLIES[body.type] });
     if (liveOnly) {
       return NextResponse.json(
         { error: "Skill diagnostics require a running session", code: "skill_diagnostics_unavailable" },
@@ -120,21 +134,18 @@ export async function POST(
       // rather than a false failure. A mismatch (e.g. an omp without --model
       // precedence) rethrows the RPC error, so a real failure still surfaces.
       try {
-        const result = await session.send(body);
-        return NextResponse.json({ success: true, data: result });
+        return await sendCommandResponse(session, body, body.type);
       } catch (error) {
         const state = (await session.send({ type: "get_state" })) as {
           model?: { id?: unknown; provider?: unknown };
         } | null;
         if (state?.model?.provider === body.provider && state?.model?.id === body.modelId) {
-          return NextResponse.json({ success: true, data: { id: body.modelId, provider: body.provider } });
+          return NextResponse.json({ success: true, sessionId: session.sessionId, data: { id: body.modelId, provider: body.provider } });
         }
         throw error;
       }
     }
-    const result = await session.send(body);
-
-    return NextResponse.json({ success: true, data: result });
+    return await sendCommandResponse(session, body, body.type);
   } catch (error) {
     return commandErrorResponse(error);
   }
