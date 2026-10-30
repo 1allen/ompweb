@@ -194,6 +194,9 @@ const HISTORY_MUTATING_COMMANDS = new Set([
   "set_fast_mode", "set_slow_mode", "set_auto_compaction", "set_auto_retry", "abort_retry",
 ]);
 
+// Commands that move the child onto a different session file themselves.
+const SESSION_ID_CHANGING_COMMANDS = new Set(["fork", "new_session", "switch_session"]);
+
 // pi-web commands with no omp RPC equivalent. The UI tolerates these failing.
 const UNSUPPORTED_COMMANDS: Record<string, string> = {
   navigate_tree: "Branch navigation is not supported over the omp RPC protocol",
@@ -367,6 +370,10 @@ export class AgentSessionWrapper {
   /** omp reported a `session-persistence` notice: its next identity change is
    * the same conversation moving to a sibling file, not a session switch. */
   private sessionMovePending = false;
+  /** A SESSION_ID_CHANGING_COMMANDS re-key is in flight: identity reads in
+   * this window apply explicit-change reset semantics, so a concurrent GET
+   * cannot re-key a switch as a stream-preserving ownership fork. */
+  private explicitSessionChangePending = false;
   private unsubscribeFrames: (() => void) | null = null;
   private readonly detectNotification = createNotificationDetector();
   /** Agent activity since the last `session_settled`: background work may still run after the turn ended. */
@@ -595,21 +602,22 @@ export class AgentSessionWrapper {
     }
   }
 
-  private applyIdentity(state: RpcSessionState): void {
+  private applyIdentity(state: RpcSessionState, resetStreamOnChange = true): void {
     const oldId = this._sessionId;
     const identityChanged = Boolean(oldId) && (state.sessionId !== oldId || (state.sessionFile && state.sessionFile !== this._sessionFile));
     // omp >= 18.5 moves a session it does not own onto a new file on its first
     // write (`session-persistence` notice). The conversation continues, so the
     // live stream and run state must survive; only the id changes.
     const moved = identityChanged && this.sessionMovePending;
-    if (identityChanged && !moved) {
+    // A different conversation (explicit switch, or an ownership fork's new
+    // file): earlier move aliases must not keep routing its notifications.
+    if (identityChanged && !moved) this.movedFromIds.length = 0;
+    if (identityChanged && resetStreamOnChange && !moved) {
       this.resetStream();
       this.promptRunning = false;
       this.awaitingAgentStart = false;
       this.awaitingAgentStartDeadline = 0;
       this.continuationGraceUntil = 0;
-      // A different conversation now: the old one's ids must not suppress its notifications.
-      this.movedFromIds.length = 0;
     }
     this._sessionId = state.sessionId;
     this._sessionFile = state.sessionFile ?? "";
@@ -618,15 +626,18 @@ export class AgentSessionWrapper {
     this.compacting = state.isCompacting;
     this.fastModeEnabled = state.fastModeEnabled ?? state.fastMode ?? this.fastModeEnabled;
     if (this._sessionFile) cacheSessionPath(this._sessionId, this._sessionFile);
-    if (moved) {
-      this.sessionMovePending = false;
-      if (oldId !== this._sessionId) {
+    if (moved) this.sessionMovePending = false;
+    if (oldId && oldId !== this._sessionId) {
+      if (moved) {
         // Tabs still showing the old id are still viewing this conversation.
         this.movedFromIds.push(oldId);
-        // Keep the old id routable: other tabs still address it, and a fresh
-        // `--resume` of the old file would fork again (its owner lives on).
-        this.onIdentityChangeCallback?.(oldId, this._sessionId, { keepOldId: true });
-        this.invalidateSessionLists();
+      }
+      // Native moves keep the old id routable for other tabs; unannounced
+      // ownership forks and explicit switches adopt only the new identity.
+      this.onIdentityChangeCallback?.(oldId, this._sessionId, moved ? { keepOldId: true } : undefined);
+      this.invalidateSessionLists();
+      if (moved || !resetStreamOnChange) {
+        this.emit({ type: "session_identity_changed", previousSessionId: oldId, sessionId: this._sessionId });
       }
     }
   }
@@ -1389,7 +1400,7 @@ export class AgentSessionWrapper {
     }
   }
 
-  /** Called when a session-changing command re-keyed this wrapper (branch/new_session/switch_session). */
+  /** Called when omp adopts a new id, whether by ownership move or explicit session change. */
   onIdentityChange(cb: (oldId: string, newId: string, options?: IdentityChangeOptions) => void): void {
     this.onIdentityChangeCallback = cb;
   }
@@ -1506,7 +1517,11 @@ export class AgentSessionWrapper {
     const wasRunning = this.isRunning();
 
     // Reconcile process-side flags with authoritative child state.
-    this.applyIdentity({ ...state, sessionFile: state.sessionFile ?? this._sessionFile });
+    // An ownership fork can occur on the first write, during a live prompt:
+    // rekey without discarding that prompt's stream or run flags. An explicit
+    // session change in flight gets full reset semantics instead, so a
+    // concurrent state read cannot re-key a switch as a fork.
+    this.applyIdentity({ ...state, sessionFile: state.sessionFile ?? this._sessionFile }, this.explicitSessionChangePending);
     this.streamSequence += 1;
 
     const awaitingExpired = !this.awaitingAgentStart || Date.now() >= this.awaitingAgentStartDeadline;
@@ -1600,12 +1615,8 @@ export class AgentSessionWrapper {
   /** After branch/new_session/switch_session the child is on a different
    * session file — re-read identity and re-register in the registry. */
   private async refreshIdentityAfterSessionChange(): Promise<string> {
-    const oldId = this._sessionId;
     const state = await this.getStateWithTimeout();
     this.applyIdentity(state);
-    if (oldId && oldId !== this._sessionId) {
-      this.onIdentityChangeCallback?.(oldId, this._sessionId);
-    }
     this.invalidateSessionLists();
     return this._sessionId;
   }
@@ -1788,6 +1799,8 @@ export class AgentSessionWrapper {
       throw new WebRpcError("Wait for the history edit to finish", "session_busy");
     }
     if (mutatesHistory) this.historyMutationPendingCount += 1;
+    const changesSessionId = SESSION_ID_CHANGING_COMMANDS.has(command.type as string);
+    if (changesSessionId) this.explicitSessionChangePending = true;
     this.resetIdleTimer();
     // Covers the whole command, including the awaits inside it: a route that
     // has an unwatched session in mid-command (predict_word on a keystroke, an
@@ -1798,6 +1811,7 @@ export class AgentSessionWrapper {
     } finally {
       this.pendingCommands = Math.max(0, this.pendingCommands - 1);
       if (mutatesHistory) this.historyMutationPendingCount -= 1;
+      if (changesSessionId) this.explicitSessionChangePending = false;
     }
   }
 
@@ -2575,7 +2589,7 @@ export async function startRpcSession(
     // the new flag up at the next natural respawn; callers that pass no
     // advisor opinion (undefined) simply reuse whatever is running.
     if (advisor === undefined || existing.advisorSpawned === effectiveAdvisor || existing.isRunning() || existing.isEditingHistory()) {
-      return { session: existing, realSessionId: sessionId };
+      return { session: existing, realSessionId: existing.sessionId };
     }
     await existing.destroyAndWait();
   }
@@ -2654,8 +2668,11 @@ export async function startRpcSession(
       // Drop every key (current id, original id, moved-from aliases).
       for (const [key, wrapper] of registry) if (wrapper === created) registry.delete(key);
     });
-    created.onIdentityChange((oldId, newId, options) => {
-      if (!options?.keepOldId && registry.get(oldId) === created) registry.delete(oldId);
+    created.onIdentityChange((_oldId, newId, options) => {
+      if (!options?.keepOldId) {
+        // A different conversation must not inherit aliases from earlier moves.
+        for (const [key, wrapper] of registry) if (wrapper === created) registry.delete(key);
+      }
       registry.set(newId, created);
     });
     registry.set(realSessionId, created);
