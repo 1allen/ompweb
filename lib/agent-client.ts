@@ -1,7 +1,7 @@
 // Client-side helper for POST /api/agent/[id].
 //
 // Every /api/agent/[id] route returns one of:
-//   { success: true, data: <result> }
+//   { success: true, sessionId: <actual session id>, data: <result> }
 //   { error: string }              (non-2xx)
 //
 // Call sites previously repeated the same 5-line fetch block 13× in
@@ -22,6 +22,7 @@ export function setSessionAdvisorSpawn(sessionId: string, enabled: boolean) {
 export async function sendAgentCommand<T = unknown>(
   sessionId: string,
   command: Record<string, unknown>,
+  onSessionChanged?: (sessionId: string) => void,
 ): Promise<T> {
   const query = advisorSpawnSessions.has(sessionId) ? "?advisor=1" : "";
   const res = await fetch(`/api/agent/${encodeURIComponent(sessionId)}${query}`, {
@@ -31,6 +32,7 @@ export async function sendAgentCommand<T = unknown>(
   });
   const body = (await res.json().catch(() => ({}))) as {
     success?: boolean;
+    sessionId?: string;
     data?: T;
     error?: string;
     code?: string;
@@ -41,6 +43,9 @@ export async function sendAgentCommand<T = unknown>(
     throw new Error(
       body.error || body.code ? formatApiError(body) : `HTTP ${res.status}`,
     );
+  }
+  if (body.sessionId && body.sessionId !== sessionId) {
+    onSessionChanged?.(body.sessionId);
   }
   return body.data as T;
 }
